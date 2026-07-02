@@ -1,29 +1,23 @@
-# CodeQL — optional deep scan
+# CodeQL —— 可选深度扫描
 
-CodeQL is heavier than everything else in this skill: it needs a compiled query database built
-from the target codebase before it can run any queries, it's slow on large projects, and the CLI
-is a ~200MB download rather than a package-manager install. Treat it as an opt-in "deep" pass, not
-part of the default scan — only build a CodeQL database when the user asks for a deeper scan or
-explicitly names CodeQL.
+CodeQL 比本 skill 中的其他工具都更重:它需要先从目标代码库构建一个编译后的查询数据库才能运行任何查询,在大项目上速度慢,CLI 是约 200MB 的下载而非通过包管理器安装。把它当作 opt-in 的"深度"扫描,而非默认扫描的一部分——只有当用户要求更深的扫描或明确点名 CodeQL 时才构建 CodeQL 数据库。
 
-## Setup
+## 安装
 
-- Check: `command -v codeql`
-- Install: no package manager install. Download the CLI bundle from the
-  [CodeQL releases page](https://github.com/github/codeql-action/releases) (or
-  `github.com/github/codeql-cli-binaries`) and add it to `PATH`. On a fresh machine:
+- 检查:`command -v codeql`
+- 安装:无包管理器安装方式。从
+  [CodeQL releases 页面](https://github.com/github/codeql-action/releases)(或
+  `github.com/github/codeql-cli-binaries`)下载 CLI bundle 并加入 `PATH`。在一台全新机器上:
   ```bash
   git clone https://github.com/github/codeql.git ~/codeql-repo   # query packs
   # download+unzip the CLI bundle for your platform from the releases page, then:
   export PATH="$PATH:/path/to/codeql-bundle/codeql"
   ```
-- If the environment's network policy blocks `github.com`/`codeload.github.com`, CodeQL simply
-  can't be installed there — say so plainly and stick to Semgrep + the language-specific tool
-  instead of pretending the scan ran.
+- 如果环境的网络策略屏蔽了 `github.com`/`codeload.github.com`,CodeQL 在该环境里就无法安装——直白地说明这一点,改用 Semgrep + 语言专属工具,而不是假装扫描已运行。
 
-## Running a scan
+## 运行扫描
 
-Two-step process — build a database, then analyze it:
+两步流程——先构建数据库,再分析它:
 
 ```bash
 # 1. Build a database (language must be one CodeQL supports: cpp, csharp, go, java,
@@ -36,24 +30,13 @@ codeql database analyze <db-path> \
   --format=sarif-latest --output=<out>/codeql-<lang>.sarif
 ```
 
-For compiled languages (Java, C/C++, C#, Go, Rust), database creation needs to actually build the
-project — CodeQL traces the compiler. If the build fails, the database will be empty or missing;
-don't report "no findings" in that case, report that the build (and therefore the scan) failed.
-For interpreted languages (Python, JavaScript/TypeScript, Ruby), no build step is needed —
-`database create` just indexes the source.
+对于编译型语言(Java、C/C++、C#、Go、Rust),数据库创建需要真正去构建项目——CodeQL 会追踪编译器。如果构建失败,数据库会是空的或不完整的;这种情况下不要报告"无发现",而要报告构建(因此也就是扫描)失败了。对于解释型语言(Python、JavaScript/TypeScript、Ruby),不需要构建步骤——`database create` 只索引源码。
 
-## Output
+## 输出
 
-SARIF at `<out>/codeql-<lang>.sarif`, one file per language if the project is multi-language.
-`generate_report.py` parses CodeQL SARIF the same way it parses Semgrep/Gosec/Brakeman SARIF, so
-no separate report logic is needed — just make sure the file lands in the same `<out>/` directory
-as everything else before running `generate_report.py`.
+SARIF 输出到 `<out>/codeql-<lang>.sarif`,多语言项目每种语言一个文件。
+`generate_report.py` 解析 CodeQL SARIF 的方式与解析 Semgrep/Gosec/Brakeman SARIF 完全相同,因此不需要单独的报告逻辑——只需确保在运行 `generate_report.py` 之前,该文件与其他所有输出落在同一个 `<out>/` 目录里。
 
-## When to actually use this
+## 何时真正使用它
 
-CodeQL's value is deep interprocedural taint tracking — it can trace user input through several
-function calls to a dangerous sink in a way pattern-matching tools can't. That's worth the setup
-cost for a pre-release security review or a codebase handling sensitive data. It's usually
-overkill for a quick pre-commit check, where Semgrep + the language-specific linter already give
-good coverage in a fraction of the time. If the user hasn't said "deep" or "thorough" or named
-CodeQL specifically, don't default to it — mention it's available and ask.
+CodeQL 的价值在于深度的过程间污点追踪——它能把用户输入跨多个函数调用一路追踪到危险 sink,这是模式匹配工具做不到的。对于发布前安全审查或处理敏感数据的代码库,这份搭建成本是值得的。对于快速的 pre-commit 检查通常是大材小用——Semgrep + 语言专属 linter 在零头时间里就能给出不错的覆盖。如果用户没有说"深度"或"彻底"或明确点名 CodeQL,不要默认上它——告诉用户它可用并询问。
