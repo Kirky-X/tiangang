@@ -32,9 +32,10 @@ rules:
 
 ### Rule 2: Raw Text Agent Run（无 Intent 分发）
 
-- **检测**: `agent.run($RAW_TEXT)` 无结构化 intent
+- **检测**: `agent.run($RAW_TEXT)` 传入变量（非字面字符串）作为 intent，无结构化 intent 类
 - **严重度**: HIGH
 - **12fa 对应**: F01/F04 Intent dispatch
+- **注意**: 通过 `metavariable-regex` 限制 $TEXT 必须是标识符（变量/参数），排除 `agent.run("fixed prompt")` 这类字面字符串调用（那是 prompt 硬编码，归 Rule 1 管）。只有传入变量的 `agent.run(user_input)` 才视为无 intent 分发的强信号。
 - **Semgrep 规则**:
 
 ```yaml
@@ -42,16 +43,21 @@ rules:
   - id: agent-raw-text-run
     languages: [python]
     severity: ERROR
-    message: "无 intent 分发检测到。应用 typed intent class + switch 分发（F01/F04）。"
-    pattern: agent.run($TEXT)
+    message: "无 intent 分发检测到：agent.run($TEXT) 传入变量而非 typed intent。应用 typed intent class + switch 分发（F01/F04）。"
+    patterns:
+      - pattern: agent.run($TEXT)
+      - metavariable-regex:
+          metavariable: $TEXT
+          # 只匹配标识符（变量/属性访问），排除字面字符串调用 agent.run("...")
+          regex: "^[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)*$"
 ```
 
 ### Rule 3: Graph Orchestration Without Explicit Loop（无显式循环的 Graph 编排）
 
-- **检测**: `from langgraph` / `from crewai` import
+- **检测**: 导入 langgraph 的 `StateGraph`/`CompiledGraph` 或 crewai 的 `Crew`/`Flow` —— 实际用于编排的类，而非整个包
 - **严重度**: HIGH
 - **12fa 对应**: F08 Own your control flow
-- **注意**: Semgrep 无法静态断言"无 while 循环"（文件级 absence 检测超出能力范围），规则只标记 import 作为信号，由审核者验证显式循环是否存在
+- **注意**: Semgrep 无法静态断言"无 while 循环"（文件级 absence 检测超出能力范围），规则只标记具体编排类的导入作为信号，由审核者验证显式循环是否存在。原规则匹配 `from langgraph import ...` 会命中任何工具类导入（如 `Message`/`HumanMessage`），缩小到 `StateGraph`/`Crew`/`Flow` 这些真正用于控制流的类。
 - **Semgrep 规则**:
 
 ```yaml
@@ -59,20 +65,21 @@ rules:
   - id: agent-graph-orchestration-no-explicit-loop
     languages: [python]
     severity: ERROR
-    message: "Graph 编排框架导入检测到。验证是否存在显式 while 循环（F08 Own your control flow）。"
+    message: "Graph 编排类（StateGraph/Crew/Flow）导入检测到。验证是否存在显式 while 循环（F08 Own your control flow）。"
     pattern-either:
-      - pattern: from langgraph import ...
-      - pattern: from crewai import ...
-      - pattern: import langgraph
-      - pattern: import crewai
+      - pattern: from langgraph.graph import StateGraph
+      - pattern: from langgraph.graph import CompiledGraph
+      - pattern: from crewai import Crew
+      - pattern: from crewai import Flow
+      - pattern: import langgraph.graph.StateGraph
 ```
 
 ### Rule 4: Missing Error Compaction（缺失错误压缩）
 
-- **检测**: try/except 无 context 回灌 + 无 `consecutive_errors` 熔断
+- **检测**: try/except 包裹 LLM/agent 调用，但无 context 回灌 + 无 `consecutive_errors` 熔断
 - **严重度**: MID
 - **12fa 对应**: F09 Compact Errors
-- **注意**: 弱信号只报 MID。Semgrep 无法静态断言"无 context 回灌"，规则标记 try/except 块作为信号
+- **注意**: 弱信号只报 MID。原规则匹配所有 try/except 块（包括文件 IO、网络请求等无关异常处理），误报严重。缩小为只匹配 try 块内含 LLM/agent/invoke 调用的场景——这些才是 F09 关心的"agent 错误压缩"问题。
 - **Semgrep 规则**:
 
 ```yaml
@@ -80,12 +87,19 @@ rules:
   - id: agent-missing-error-compaction
     languages: [python]
     severity: WARNING
-    message: "异常捕获检测到。验证是否有 context 回灌 + consecutive_errors 熔断（F09 Compact Errors）。"
-    pattern: |
-      try:
-          ...
-      except $E:
-          ...
+    message: "LLM/agent 调用异常捕获检测到。验证是否有 context 回灌 + consecutive_errors 熔断（F09 Compact Errors）。"
+    patterns:
+      - pattern: |
+          try:
+              ...
+              $CALL(...)
+              ...
+          except $E:
+              ...
+      - metavariable-regex:
+          metavariable: $CALL
+          # 只匹配 LLM/agent 相关调用：llm.chat / agent.run / chain.invoke / model.generate 等
+          regex: "(llm|agent|chain|model|chat|completion|client|runner|worker)\\.[a-zA-Z_][a-zA-Z0-9_]*"
 ```
 
 ### Rule 5: Scattered State Fields（散落状态字段）
@@ -182,28 +196,39 @@ rules:
   - id: agent-raw-text-run
     languages: [python]
     severity: ERROR
-    message: "无 intent 分发检测到。应用 typed intent class + switch 分发（F01/F04）。"
-    pattern: agent.run($TEXT)
+    message: "无 intent 分发检测到：agent.run($TEXT) 传入变量而非 typed intent。应用 typed intent class + switch 分发（F01/F04）。"
+    patterns:
+      - pattern: agent.run($TEXT)
+      - metavariable-regex:
+          metavariable: $TEXT
+          regex: "^[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)*$"
 
   - id: agent-graph-orchestration-no-explicit-loop
     languages: [python]
     severity: ERROR
-    message: "Graph 编排框架导入检测到。验证是否存在显式 while 循环（F08 Own your control flow）。"
+    message: "Graph 编排类（StateGraph/Crew/Flow）导入检测到。验证是否存在显式 while 循环（F08 Own your control flow）。"
     pattern-either:
-      - pattern: from langgraph import ...
-      - pattern: from crewai import ...
-      - pattern: import langgraph
-      - pattern: import crewai
+      - pattern: from langgraph.graph import StateGraph
+      - pattern: from langgraph.graph import CompiledGraph
+      - pattern: from crewai import Crew
+      - pattern: from crewai import Flow
+      - pattern: import langgraph.graph.StateGraph
 
   - id: agent-missing-error-compaction
     languages: [python]
     severity: WARNING
-    message: "异常捕获检测到。验证是否有 context 回灌 + consecutive_errors 熔断（F09 Compact Errors）。"
-    pattern: |
-      try:
-          ...
-      except $E:
-          ...
+    message: "LLM/agent 调用异常捕获检测到。验证是否有 context 回灌 + consecutive_errors 熔断（F09 Compact Errors）。"
+    patterns:
+      - pattern: |
+          try:
+              ...
+              $CALL(...)
+              ...
+          except $E:
+              ...
+      - metavariable-regex:
+          metavariable: $CALL
+          regex: "(llm|agent|chain|model|chat|completion|client|runner|worker)\\.[a-zA-Z_][a-zA-Z0-9_]*"
 
   - id: agent-scattered-state-fields
     languages: [python]

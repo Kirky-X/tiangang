@@ -1,6 +1,6 @@
 {
   "name": "tiangang",
-  "description": "专业 SAST 静态应用安全测试套件,自动检测语言并调度 Semgrep + CodeQL + 9 种语言专属扫描器(Bandit/FindSecBugs/Gosec/Flawfinder/Cppcheck/Brakeman/Psalm/Security Code Scan/cargo-audit/Miri),统一报告。",
+  "description": "专业 SAST 静态应用安全测试套件,自动检测语言并调度 Semgrep + CodeQL + 10 种语言专属扫描器(Bandit/FindSecBugs/Gosec/Flawfinder/Cppcheck/Brakeman/Psalm/Security Code Scan/cargo-audit/Miri),统一报告。",
   "license": "MIT",
   "version": "0.1.0",
   "author": "Kirky-X",

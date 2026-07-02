@@ -11,7 +11,7 @@ Tiangang 是一个面向 AI agent 的 SAST(static application security testing)s
 
 ## 功能特性
 
-- **9 种语言专属扫描器** —— 每种语言都有目的构建的工具,而非通用规则套用:
+- **10 种语言专属扫描器** —— 每种语言都有目的构建的工具,而非通用规则套用:
   - Python → **Bandit**
   - Java → **FindSecBugs**(Maven/Gradle 集成)
   - Go → **Gosec**

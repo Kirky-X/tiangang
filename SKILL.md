@@ -61,7 +61,7 @@ python3 scripts/run_scan.py <target-dir> [--out <results-dir>] [--langs python,g
 
 运行 Semgrep（始终运行——语言无关，能捕获 hardcoded secrets 等各语言专属工具不查的问题）加上第 2 步中可用的语言专属工具。把每个工具的原始输出（SARIF 或 JSON，见 `references/tools.md`）写入 results 目录，同时写入 `scan_manifest.json` 记录哪些运行了、哪些被跳过。被跳过的工具不会让运行失败——带着"这里有什么没覆盖"的清晰说明的局部扫描，比拒绝产出任何东西更有用。
 
-对于实现 LLM agent 的代码库（LangChain、CrewAI、AutoGen、langgraph 等），在 `--config auto` 之外加载 agent 反模式 Semgrep 规则集，把 12-factor-agents 架构违规作为 SAST 信号捕获——规则和精确的 `--config agent-antipatterns.yml` 调用见 `references/agent-semgrep-rules.md`。`run_scan.py` 默认不加载它，所以当目标看起来像 agent 代码时手动加上，或单独跑一次 Semgrep。
+对于实现 LLM agent 的代码库（LangChain、CrewAI、AutoGen、langgraph 等），在 `--config auto` 之外加载 agent 反模式 Semgrep 规则集，把 12-factor-agents 架构违规作为 SAST 信号捕获——规则说明见 `references/agent-semgrep-rules.md`，物化后的规则文件位于 `rules/agent-antipatterns.yml`。`run_scan.py` 支持 `--agent-rules` 开关自动加载该规则集，所以当目标看起来像 agent 代码时加上该开关即可，或单独跑一次 Semgrep。
 
 **这一步不运行 CodeQL。** CodeQL 需要先构建编译后的查询数据库，明显更慢——把它当作 opt-in 的深度扫描。如果用户要求"深度"或"彻底"审计，或明确点名 CodeQL，读 `references/codeql.md` 并单独运行那个流程，在生成报告前把它的 SARIF 输出写入同一个 results 目录。
 
@@ -83,4 +83,4 @@ python3 scripts/generate_report.py <results-dir> [--out report.md]
 
 - `references/tools.md` — 每种语言的工具、检测信号、安装命令、扫描命令、输出格式完整表。在脚本未处理的手动安装或调用任何工具前读这个，或当脚本的安装/扫描命令需要针对用户特定环境调整时（例如没有 `apt`、有代理、气隙机）。
 - `references/codeql.md` — 独立、更重的 CodeQL 流程：CLI 设置、数据库创建、运行安全查询套件。只在深度/opt-in 扫描时读这个。
-- `references/agent-semgrep-rules.md` — 自定义 Semgrep 规则集，把 12-factor-agents 架构反模式（框架黑盒实例化、缺失 intent dispatch、无显式循环的图编排、缺失错误压缩、状态散落、缺失 context serializer、中断式 human contact）映射为 SAST 信号。扫描 agent 代码库时（LangChain、CrewAI、langgraph、AutoGen 等）作为 `--config agent-antipatterns.yml` 与 `--config auto` 一起加载。
+- `references/agent-semgrep-rules.md` — 自定义 Semgrep 规则集，把 12-factor-agents 架构反模式（框架黑盒实例化、缺失 intent dispatch、无显式循环的图编排、缺失错误压缩、状态散落、缺失 context serializer、中断式 human contact）映射为 SAST 信号。规则文件物化为 `rules/agent-antipatterns.yml`，扫描 agent 代码库时（LangChain、CrewAI、langgraph、AutoGen 等）通过 `run_scan.py --agent-rules` 自动加载，或作为 `--config rules/agent-antipatterns.yml` 与 `--config auto` 一起加载。

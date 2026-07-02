@@ -32,6 +32,8 @@ def norm_severity(raw):
         "blocker": "critical", "critical": "critical",
         "high": "high", "medium": "medium", "moderate": "medium",
         "low": "low", "info": "info", "informational": "info",
+        # cppcheck severity values: error/warning/style/performance/portability
+        "style": "low", "performance": "low", "portability": "low",
         "1": "low", "2": "medium", "3": "high",  # cppcheck-style numeric/verbosity fallback
     }
     return mapping.get(s, s if s in SEVERITY_ORDER else "unknown")
@@ -46,9 +48,17 @@ def parse_sarif(path, tool_name):
         return [], f"could not parse {path}: {e}"
 
     for run in data.get("runs", []):
-        rules = {r["id"]: r for r in run.get("tool", {}).get("driver", {}).get("rules", [])}
+        rules_list = run.get("tool", {}).get("driver", {}).get("rules", [])
+        rules = {r.get("id"): r for r in rules_list if "id" in r}
         for result in run.get("results", []):
-            rule_id = result.get("ruleId", "unknown-rule")
+            rule_id = result.get("ruleId")
+            if rule_id is None:
+                # SARIF allows referencing rules by index; guard against out-of-range
+                rule_idx = result.get("ruleIndex")
+                if isinstance(rule_idx, int) and 0 <= rule_idx < len(rules_list):
+                    rule_id = rules_list[rule_idx].get("id", "unknown-rule")
+                else:
+                    rule_id = "unknown-rule"
             rule = rules.get(rule_id, {})
             level = result.get("level") or rule.get("defaultConfiguration", {}).get("level")
             msg = result.get("message", {}).get("text", "")
@@ -108,25 +118,89 @@ def parse_cargo_audit(path):
     for vuln in data.get("vulnerabilities", {}).get("list", []):
         advisory = vuln.get("advisory", {})
         pkg = vuln.get("package", {})
+        # RUSTSEC advisories: severity is optional; when absent, default to MEDIUM
+        # (not HIGH — over-rating noise vulnerabilities drowns out real critical ones)
         findings.append({
             "tool": "cargo-audit", "rule": advisory.get("id", "unknown"),
-            "severity": norm_severity(advisory.get("severity") or "high"),
+            "severity": norm_severity(advisory.get("severity") or "medium"),
             "file": "Cargo.lock", "line": "?",
             "message": f"{pkg.get('name', '?')} {pkg.get('version', '?')}: {advisory.get('title', '')}",
         })
     return findings, None
 
 
+def parse_security_code_scan(path):
+    """Parse Security Code Scan (.NET Roslyn analyzer) JSON output.
+
+    Expected format: a JSON array of objects with fields like:
+      [{"ruleId": "SCS001", "severity": "Warning", "message": "...",
+        "file": "...", "line": 42}, ...]
+    Falls back gracefully if the shape differs.
+    """
+    findings = []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return [], f"could not parse {path}: {e}"
+    items = data if isinstance(data, list) else data.get("results", [])
+    for r in items:
+        findings.append({
+            "tool": "security-code-scan", "rule": r.get("ruleId", r.get("rule", "unknown")),
+            "severity": norm_severity(r.get("severity")),
+            "file": r.get("file", r.get("location", "unknown file")),
+            "line": r.get("line", "?"),
+            "message": r.get("message", ""),
+        })
+    return findings, None
+
+
+def parse_miri_log(path):
+    """Parse Miri (Rust UB detector) text log.
+
+    Looks for lines like:
+      error: Undefined Behavior: ... at src/foo.rs:42:15
+    """
+    findings = []
+    try:
+        with open(path) as f:
+            for line in f:
+                if "error: Undefined Behavior" not in line:
+                    continue
+                # Try to extract file:line from trailing " at <path>:<line>:<col>"
+                file_path = "unknown file"
+                line_no = "?"
+                if " at " in line:
+                    loc_part = line.rsplit(" at ", 1)[-1].strip()
+                    # loc_part looks like "src/foo.rs:42:15"
+                    parts = loc_part.rsplit(":", 2)
+                    if len(parts) >= 2:
+                        file_path = parts[0]
+                        line_no = parts[1]
+                findings.append({
+                    "tool": "miri", "rule": "undefined-behavior",
+                    "severity": "high", "file": file_path, "line": line_no,
+                    "message": line.split("error: Undefined Behavior:", 1)[-1].strip() if "error: Undefined Behavior:" in line else line.strip(),
+                })
+    except Exception as e:
+        return [], f"could not parse {path}: {e}"
+    return findings, None
+
+
 # filename (in results dir) -> (parser, tool label)
 PARSERS = {
     "semgrep.sarif": (lambda p: parse_sarif(p, "semgrep"), "semgrep"),
+    "semgrep-agent.sarif": (lambda p: parse_sarif(p, "semgrep-agent"), "semgrep-agent"),
     "gosec.sarif": (lambda p: parse_sarif(p, "gosec"), "gosec"),
     "flawfinder.sarif": (lambda p: parse_sarif(p, "flawfinder"), "flawfinder"),
     "brakeman.sarif": (lambda p: parse_sarif(p, "brakeman"), "brakeman"),
     "psalm.sarif": (lambda p: parse_sarif(p, "psalm"), "psalm"),
+    "findsecbugs.sarif": (lambda p: parse_sarif(p, "findsecbugs"), "findsecbugs"),
     "bandit.json": (parse_bandit, "bandit"),
     "cppcheck.xml": (parse_cppcheck, "cppcheck"),
     "cargo-audit.json": (parse_cargo_audit, "cargo-audit"),
+    "security-code-scan.json": (parse_security_code_scan, "security-code-scan"),
+    "miri.log": (parse_miri_log, "miri"),
 }
 
 
@@ -147,7 +221,19 @@ def collect_findings(results_dir):
             all_findings.extend(findings)
             if err:
                 parse_errors.append(err)
-    return all_findings, parse_errors
+    # Deduplicate cross-tool findings: different tools (e.g. semgrep + bandit)
+    # may flag the same issue at the same file:line:rule. Keep the first
+    # occurrence (tools are iterated in PARSERS order, which lists semgrep
+    # first — its findings win ties).
+    seen = set()
+    deduped = []
+    for f in all_findings:
+        key = (f["file"], str(f["line"]), f["rule"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+    return deduped, parse_errors
 
 
 def render_report(results_dir, findings, parse_errors, manifest):
@@ -179,6 +265,21 @@ def render_report(results_dir, findings, parse_errors, manifest):
         lines.append("")
         for s in skipped:
             lines.append(f"- **{s['tool']}**: {s['reason']}")
+        lines.append("")
+
+    # T-P1-4: surface tools that were attempted but failed (non-zero exit) —
+    # a clean-looking report must not silently hide a crashed scanner.
+    failed_tools = [r for r in manifest.get("ran", []) if r.get("returncode", 0) != 0]
+    if failed_tools:
+        lines.append("## Tools attempted but failed")
+        lines.append("")
+        lines.append("These tools were invoked but exited non-zero — their coverage is missing "
+                      "from the findings below. Treat the report as partial; investigate the "
+                      "failures before relying on a clean result.")
+        lines.append("")
+        for r in failed_tools:
+            tail = r.get("log_tail", "")
+            lines.append(f"- **{r['tool']}** (exit {r['returncode']}): {tail[-300:] if tail else '(no output)'}")
         lines.append("")
 
     if parse_errors:

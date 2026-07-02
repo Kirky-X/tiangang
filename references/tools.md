@@ -116,8 +116,7 @@
   analyzer,所以挂入 `dotnet build` 而非作为独立 CLI 运行)
 - 扫描:`dotnet build /p:TreatWarningsAsErrors=false /clp:ErrorsOnly` 并从构建输出中捕获 analyzer
   警告,或使用 `dotnet build -warnaserror:SCS0001-SCS9999` 让特定规则使构建失败。没有原生 SARIF 导出——从构建日志中解析
-  `SCSxxxx` 警告码并自行映射到 `<out>/security-code-scan.json`(见
-  `generate_report.py` 的 `parse_dotnet_build_log` 了解期望的数据形状)。
+  `SCSxxxx` 警告码并自行映射到 `<out>/security-code-scan.json`(需手动整理为下列 JSON 形状后保存为 security-code-scan.json)。
 - 捕获:SQL 注入、弱加密/哈希、XXE、路径穿越、不安全反序列化、硬编码口令、用于 token 的弱随机性。
 
 ## Rust —— cargo-audit(依赖 CVE)+ Miri(内存安全)

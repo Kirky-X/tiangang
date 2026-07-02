@@ -4,8 +4,8 @@
 # on PATH. Mirrors the install commands documented in references/tools.md —
 # keep the two in sync if you change one.
 #
-# Usage: ./install_tools.sh <lang1> [lang2 ...]
-#        ./install_tools.sh all
+# Usage: ./install_tools.sh [--target <dir>] <lang1> [lang2 ...]
+#        ./install_tools.sh [--target <dir>] all
 #
 # Prints a per-tool OK / INSTALLED / FAILED status line to stdout, and exits
 # non-zero only if a language was requested but none of its tools could be
@@ -14,6 +14,9 @@
 # attempted — some tools working is better than aborting entirely.
 
 set -uo pipefail
+
+TARGET="."
+[[ "${1:-}" == "--target" ]] && TARGET="$2" && shift 2
 
 LANGS=("$@")
 if [[ ${#LANGS[@]} -eq 0 ]]; then
@@ -66,7 +69,7 @@ for lang in "${LANGS[@]}"; do
       check_or_install "brakeman" "command -v brakeman" "gem install brakeman"
       ;;
     php)
-      if [[ -f "composer.json" ]]; then
+      if [[ -f "$TARGET/composer.json" ]]; then
         check_or_install "psalm" "command -v psalm || [[ -x vendor/bin/psalm ]]" "composer require --dev vimeo/psalm psalm/plugin-security"
       else
         echo "SKIP      psalm (no composer.json in project root — falling back to semgrep's PHP ruleset)"
@@ -77,7 +80,7 @@ for lang in "${LANGS[@]}"; do
       ;;
     rust)
       check_or_install "cargo-audit" "cargo audit --version" "cargo install cargo-audit"
-      if grep -rq "unsafe" --include='*.rs' . 2>/dev/null; then
+      if grep -rq "unsafe" --include='*.rs' "$TARGET" 2>/dev/null; then
         check_or_install "miri" "cargo +nightly miri --version" "rustup +nightly component add miri"
       else
         echo "SKIP      miri (no 'unsafe' blocks found — not worth the nightly toolchain setup)"

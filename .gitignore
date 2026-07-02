@@ -46,3 +46,6 @@ yarn-error.log*
 
 # Meta
 .meta
+
+# 扫描产物
+.security-audit

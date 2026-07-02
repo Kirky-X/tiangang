@@ -11,7 +11,7 @@ The four steps map to four scripts under `scripts/`, each one's output feeding t
 
 ## Features
 
-- **9 language-specific scanners** — purpose-built tools per language, not generic rules:
+- **10 language-specific scanners** — purpose-built tools per language, not generic rules:
   - Python → **Bandit**
   - Java → **FindSecBugs** (Maven/Gradle integration)
   - Go → **Gosec**
