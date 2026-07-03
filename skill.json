@@ -2,9 +2,19 @@
   "name": "tiangang",
   "description": "专业 SAST 静态应用安全测试套件,自动检测语言并调度 Semgrep + CodeQL + 10 种语言专属扫描器(Bandit/FindSecBugs/Gosec/Flawfinder/Cppcheck/Brakeman/Psalm/Security Code Scan/cargo-audit/Miri),统一报告。",
   "license": "MIT",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Kirky-X",
   "repo": "https://github.com/Kirky-X/tiangang",
   "homepage": "https://github.com/Kirky-X/tiangang",
-  "tag": ["sast", "security-audit", "vulnerability-scan", "semgrep", "codeql", "bandit", "gosec", "static-analysis", "security"]
+  "tag": [
+    "sast",
+    "security-audit",
+    "vulnerability-scan",
+    "semgrep",
+    "codeql",
+    "bandit",
+    "gosec",
+    "static-analysis",
+    "security"
+  ]
 }
