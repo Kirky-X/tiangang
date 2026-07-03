@@ -39,6 +39,20 @@ def norm_severity(raw):
     return mapping.get(s, s if s in SEVERITY_ORDER else "unknown")
 
 
+def _line_sort_key(line):
+    """Sort key for finding line numbers: numeric lines first (ascending),
+    non-numeric (e.g. "?") last. Avoids the string-dictionary bug where
+    "1"/"10"/"2" would sort as 1 → 10 → 2 instead of 1 → 2 → 10.
+
+    Returns a tuple (group, value) so numeric and non-numeric lines never
+    interleave by accident.
+    """
+    s = str(line)
+    if s.isdigit():
+        return (0, int(s))
+    return (1, s)
+
+
 def parse_sarif(path, tool_name):
     findings = []
     try:
@@ -295,7 +309,7 @@ def render_report(results_dir, findings, parse_errors, manifest):
                       "above, nothing more.")
         return "\n".join(lines)
 
-    findings_sorted = sorted(findings, key=lambda f: (SEVERITY_RANK.get(f["severity"], 99), f["file"], str(f["line"])))
+    findings_sorted = sorted(findings, key=lambda f: (SEVERITY_RANK.get(f["severity"], 99), f["file"], _line_sort_key(f["line"])))
 
     lines.append("## Findings")
     lines.append("")

@@ -38,11 +38,18 @@ check_or_install() {
     return 0
   fi
   echo "Installing $name ..."
-  if eval "$install_cmd" >/tmp/install_${name// /_}.log 2>&1; then
+  # B6: mktemp creates an unpredictable log path (mitigates symlink attacks
+  # where an attacker pre-creates /tmp/install_<name>.log as a symlink to a
+  # system file that this script — when run as root — would overwrite).
+  # mktemp failure (e.g. /tmp full) leaves logfile empty, the subsequent
+  # redirection fails, and the `if` branch reports FAILED (no silent success).
+  local logfile
+  logfile=$(mktemp /tmp/install_${name// /_}.XXXXXX.log)
+  if eval "$install_cmd" >"$logfile" 2>&1; then
     echo "INSTALLED $name"
     STATUS_OK=$((STATUS_OK + 1))
   else
-    echo "FAILED    $name — see /tmp/install_${name// /_}.log (check network access to the required registry, or install manually per references/tools.md)"
+    echo "FAILED    $name — see $logfile (check network access to the required registry, or install manually per references/tools.md)"
     STATUS_FAIL=$((STATUS_FAIL + 1))
   fi
 }

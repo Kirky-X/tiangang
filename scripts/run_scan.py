@@ -39,6 +39,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # skipping the rust branch.
 SUPPORTED_LANGS = {"python", "java", "go", "c_cpp", "ruby", "php", "dotnet", "rust"}
 
+# B3: reuse SKIP_DIRS from detect_languages to avoid two divergent skip sets
+# (the old _has_ruby_code inline tuple missed __pycache__/venv/.venv/.tox/bin/obj).
+from detect_languages import SKIP_DIRS
+
 
 def sh(cmd, cwd=None, timeout=600):
     """Run a command (list form), returning (returncode, combined_output). Never raises.
@@ -91,15 +95,16 @@ def run_tool(name, ran, cmd, cwd=None, timeout=600, output_file=None, output_str
         rc = proc.returncode
         stdout_content = proc.stdout or ""
         stderr_content = proc.stderr or ""
+        log = stdout_content + stderr_content
         if output_file:
             content = stdout_content if output_stream == "stdout" else stderr_content
             if content:
                 try:
                     with open(output_file, "w") as f:
                         f.write(content)
-                except Exception:
-                    pass
-        log = stdout_content + stderr_content
+                except Exception as e:
+                    rc = -2
+                    log = log + f"[output write failed] {e}"
     except subprocess.TimeoutExpired:
         rc, log = -1, f"timed out after {timeout}s"
     except Exception as e:
@@ -132,8 +137,9 @@ def _has_ruby_code(target):
     if os.path.exists(os.path.join(target, "Gemfile")):
         return True
     for root, dirs, files in os.walk(target):
-        dirs[:] = [d for d in dirs if not d.startswith(".")
-                   and d not in ("node_modules", "vendor", "target", "build", "dist")]
+        # B3: reuse SKIP_DIRS from detect_languages to keep behavior consistent
+        # (single source of truth — no divergent inline tuple).
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
         if any(f.endswith(".rb") for f in files):
             return True
     return False
@@ -145,6 +151,11 @@ def _run_semgrep(target, out_dir, ran, agent_rules=None):
     semgrep_cmd = ["semgrep", "scan", "--config", "auto", "--exclude=.security-audit",
                    "--sarif", "--output", sarif, target]
     rc, out = sh(semgrep_cmd, timeout=900)
+    # B4: preserve first-attempt error so debugging info isn't lost on fallback.
+    # Previously `out` and `semgrep_cmd` were reassigned, dropping the original
+    # network error from the manifest — debuggers had no clue why fallback fired.
+    first_rc, first_out, first_cmd = rc, out, semgrep_cmd[:]
+    fallback_triggered = False
     # Offline fallback: if --config auto fails due to network/registry, retry with bundled rulesets
     if rc != 0 and any(kw in out.lower() for kw in ("network", "registry", "timeout", "connection")):
         print("warning: semgrep --config auto failed (likely network issue), "
@@ -152,8 +163,18 @@ def _run_semgrep(target, out_dir, ran, agent_rules=None):
         semgrep_cmd = ["semgrep", "scan", "--config", "p/security-audit", "--config", "p/secrets",
                        "--exclude=.security-audit", "--sarif", "--output", sarif, target]
         rc, out = sh(semgrep_cmd, timeout=900)
-    ran.append({"tool": "semgrep", "command": " ".join(semgrep_cmd),
-                "returncode": rc, "log_tail": out[-2000:] if out else ""})
+        fallback_triggered = True
+    # B4: when fallback fired, log_tail + command record BOTH attempts so the
+    # manifest tells the full story (original error + fallback outcome).
+    if fallback_triggered:
+        log_tail = (f"[first attempt rc={first_rc}]\n{first_out[-1000:]}\n"
+                    f"[fallback rc={rc}]\n{out[-1000:]}")
+        command_str = f"first: {' '.join(first_cmd)} | fallback: {' '.join(semgrep_cmd)}"
+    else:
+        log_tail = out[-2000:] if out else ""
+        command_str = " ".join(semgrep_cmd)
+    ran.append({"tool": "semgrep", "command": command_str,
+                "returncode": rc, "log_tail": log_tail[-2000:] if log_tail else ""})
 
     # Load agent antipattern rules if requested (for LangChain/CrewAI/etc. codebases)
     if agent_rules and os.path.exists(agent_rules):
@@ -161,6 +182,9 @@ def _run_semgrep(target, out_dir, ran, agent_rules=None):
         agent_cmd = ["semgrep", "scan", "--config", agent_rules, "--exclude=.security-audit",
                      "--sarif", "--output", agent_sarif, target]
         run_tool("semgrep-agent", ran, agent_cmd, timeout=900)
+    elif agent_rules:
+        print(f"warning: --agent-rules file not found: {agent_rules} — agent antipattern scan skipped",
+              file=sys.stderr)
 
 
 def main():

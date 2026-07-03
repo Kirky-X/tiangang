@@ -1,6 +1,7 @@
 .claude
 .venv
 openspec/
+specmark/
 temp
 .gitnexus
 
@@ -49,3 +50,8 @@ yarn-error.log*
 
 # 扫描产物
 .security-audit
+
+# 测试代码（开发期使用，不入仓库）
+tests/
+**/tests/
+**/test/
