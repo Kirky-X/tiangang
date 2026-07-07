@@ -23,12 +23,15 @@ shell=True). Path arguments with shell metacharacters ($(), backticks, quotes)
 are treated as literal strings, never parsed by the shell. This prevents
 command injection via crafted target paths or --out values.
 """
+
 import argparse
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,7 +40,29 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # detect_languages.py's EXT_MAP. Used to validate --langs input early so a
 # typo like `--langs python,rustt` produces a warning instead of silently
 # skipping the rust branch.
-SUPPORTED_LANGS = {"python", "java", "go", "c_cpp", "ruby", "php", "dotnet", "rust"}
+SUPPORTED_LANGS = {
+    "python",
+    "java",
+    "go",
+    "c_cpp",
+    "ruby",
+    "php",
+    "dotnet",
+    "rust",
+    "javascript",  # JS + TS share scanner set (njsscan + eslint-plugin-security)
+}
+
+# Default upper bound on concurrent scanners. Each scanner is an I/O-bound
+# subprocess wait, so a modest parallelism turns a serial ~10-tool run into
+# roughly the slowest single tool. Override via env for large hosts.
+
+
+def _max_workers():
+    env = os.environ.get("TIANGANG_MAX_WORKERS")
+    if env and env.strip().isdigit() and int(env) > 0:
+        return int(env)
+    return 8
+
 
 # B3: reuse SKIP_DIRS from detect_languages to avoid two divergent skip sets
 # (the old _has_ruby_code inline tuple missed __pycache__/venv/.venv/.tox/bin/obj).
@@ -53,8 +78,12 @@ def sh(cmd, cwd=None, timeout=600):
     """
     try:
         proc = subprocess.run(
-            cmd, cwd=cwd, timeout=timeout,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cmd,
+            cwd=cwd,
+            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         combined = (proc.stdout or "") + (proc.stderr or "")
         return proc.returncode, combined
@@ -70,7 +99,14 @@ def have(cmd):
 
 def detect_languages(target):
     """Detect languages in target dir. Returns [] on failure (with warning to stderr)."""
-    rc, out = sh([sys.executable, os.path.join(SCRIPT_DIR, "detect_languages.py"), target, "--json"])
+    rc, out = sh(
+        [
+            sys.executable,
+            os.path.join(SCRIPT_DIR, "detect_languages.py"),
+            target,
+            "--json",
+        ]
+    )
     if rc != 0:
         print(f"warning: language detection failed (rc={rc}): {out}", file=sys.stderr)
         return []
@@ -80,7 +116,9 @@ def detect_languages(target):
         return []
 
 
-def run_tool(name, ran, cmd, cwd=None, timeout=600, output_file=None, output_stream="stdout"):
+def run_tool(
+    name, ran, cmd, cwd=None, timeout=600, output_file=None, output_stream="stdout"
+):
     """Run a tool. If output_file given, write the specified stream to that path.
 
     cmd MUST be a list — the shell is never invoked, preventing command injection.
@@ -89,8 +127,12 @@ def run_tool(name, ran, cmd, cwd=None, timeout=600, output_file=None, output_str
     """
     try:
         proc = subprocess.run(
-            cmd, cwd=cwd, timeout=timeout,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cmd,
+            cwd=cwd,
+            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         rc = proc.returncode
         stdout_content = proc.stdout or ""
@@ -109,8 +151,14 @@ def run_tool(name, ran, cmd, cwd=None, timeout=600, output_file=None, output_str
         rc, log = -1, f"timed out after {timeout}s"
     except Exception as e:
         rc, log = -1, str(e)
-    ran.append({"tool": name, "command": " ".join(cmd) if isinstance(cmd, list) else cmd,
-                "returncode": rc, "log_tail": log[-2000:] if log else ""})
+    ran.append(
+        {
+            "tool": name,
+            "command": " ".join(cmd) if isinstance(cmd, list) else cmd,
+            "returncode": rc,
+            "log_tail": log[-2000:] if log else "",
+        }
+    )
 
 
 def _cargo_audit_available():
@@ -148,8 +196,17 @@ def _has_ruby_code(target):
 def _run_semgrep(target, out_dir, ran, agent_rules=None):
     """Run semgrep with offline fallback and optional agent rules."""
     sarif = os.path.join(out_dir, "semgrep.sarif")
-    semgrep_cmd = ["semgrep", "scan", "--config", "auto", "--exclude=.security-audit",
-                   "--sarif", "--output", sarif, target]
+    semgrep_cmd = [
+        "semgrep",
+        "scan",
+        "--config",
+        "auto",
+        "--exclude=.security-audit",
+        "--sarif",
+        "--output",
+        sarif,
+        target,
+    ]
     rc, out = sh(semgrep_cmd, timeout=900)
     # B4: preserve first-attempt error so debugging info isn't lost on fallback.
     # Previously `out` and `semgrep_cmd` were reassigned, dropping the original
@@ -157,43 +214,223 @@ def _run_semgrep(target, out_dir, ran, agent_rules=None):
     first_rc, first_out, first_cmd = rc, out, semgrep_cmd[:]
     fallback_triggered = False
     # Offline fallback: if --config auto fails due to network/registry, retry with bundled rulesets
-    if rc != 0 and any(kw in out.lower() for kw in ("network", "registry", "timeout", "connection")):
-        print("warning: semgrep --config auto failed (likely network issue), "
-              "falling back to p/security-audit p/secrets", file=sys.stderr)
-        semgrep_cmd = ["semgrep", "scan", "--config", "p/security-audit", "--config", "p/secrets",
-                       "--exclude=.security-audit", "--sarif", "--output", sarif, target]
+    if rc != 0 and any(
+        kw in out.lower() for kw in ("network", "registry", "timeout", "connection")
+    ):
+        print(
+            "warning: semgrep --config auto failed (likely network issue), "
+            "falling back to p/security-audit p/secrets",
+            file=sys.stderr,
+        )
+        semgrep_cmd = [
+            "semgrep",
+            "scan",
+            "--config",
+            "p/security-audit",
+            "--config",
+            "p/secrets",
+            "--exclude=.security-audit",
+            "--sarif",
+            "--output",
+            sarif,
+            target,
+        ]
         rc, out = sh(semgrep_cmd, timeout=900)
         fallback_triggered = True
     # B4: when fallback fired, log_tail + command record BOTH attempts so the
     # manifest tells the full story (original error + fallback outcome).
     if fallback_triggered:
-        log_tail = (f"[first attempt rc={first_rc}]\n{first_out[-1000:]}\n"
-                    f"[fallback rc={rc}]\n{out[-1000:]}")
-        command_str = f"first: {' '.join(first_cmd)} | fallback: {' '.join(semgrep_cmd)}"
+        log_tail = (
+            f"[first attempt rc={first_rc}]\n{first_out[-1000:]}\n"
+            f"[fallback rc={rc}]\n{out[-1000:]}"
+        )
+        command_str = (
+            f"first: {' '.join(first_cmd)} | fallback: {' '.join(semgrep_cmd)}"
+        )
     else:
         log_tail = out[-2000:] if out else ""
         command_str = " ".join(semgrep_cmd)
-    ran.append({"tool": "semgrep", "command": command_str,
-                "returncode": rc, "log_tail": log_tail[-2000:] if log_tail else ""})
+    ran.append(
+        {
+            "tool": "semgrep",
+            "command": command_str,
+            "returncode": rc,
+            "log_tail": log_tail[-2000:] if log_tail else "",
+        }
+    )
 
     # Load agent antipattern rules if requested (for LangChain/CrewAI/etc. codebases)
     if agent_rules and os.path.exists(agent_rules):
         agent_sarif = os.path.join(out_dir, "semgrep-agent.sarif")
-        agent_cmd = ["semgrep", "scan", "--config", agent_rules, "--exclude=.security-audit",
-                     "--sarif", "--output", agent_sarif, target]
+        agent_cmd = [
+            "semgrep",
+            "scan",
+            "--config",
+            agent_rules,
+            "--exclude=.security-audit",
+            "--sarif",
+            "--output",
+            agent_sarif,
+            target,
+        ]
         run_tool("semgrep-agent", ran, agent_cmd, timeout=900)
     elif agent_rules:
-        print(f"warning: --agent-rules file not found: {agent_rules} — agent antipattern scan skipped",
-              file=sys.stderr)
+        print(
+            f"warning: --agent-rules file not found: {agent_rules} — agent antipattern scan skipped",
+            file=sys.stderr,
+        )
+
+
+def _tool_thunk(name, cmd, **kwargs):
+    """Build a scanner thunk: runs one tool via run_tool, returns its ran entries.
+
+    Each thunk owns a private ``ran`` list so concurrent execution never
+    mutates shared state. Per-tool ``timeout`` is forwarded via kwargs and
+    enforced by subprocess.run inside run_tool — concurrency adds no global
+    deadline, so timeout control is identical to the serial version.
+    """
+
+    def _run():
+        r = []
+        run_tool(name, r, cmd, **kwargs)
+        return r
+
+    return _run
+
+
+def _semgrep_thunk(target, out_dir, agent_rules):
+    """Wrap _run_semgrep (which has its own offline-fallback + agent-rules flow)
+    as a thunk returning a ran-entry list, so it composes with the other scanners
+    under the concurrent runner."""
+
+    def _run():
+        r = []
+        _run_semgrep(target, out_dir, r, agent_rules=agent_rules)
+        return r
+
+    return _run
+
+
+def _eslint_security_configured(target):
+    """True iff the target has an eslint config that wires eslint-plugin-security.
+
+    Mirrors the detection in install_tools.sh. ESLint rules live in the project
+    (the plugin is a devDependency, the config extends/loads it), so — like
+    FindSecBugs / Security Code Scan — we run it only when the user has wired it,
+    and skip with guidance otherwise rather than silently modifying package.json.
+    """
+    cfg_names = [
+        "eslint.config.js",
+        "eslint.config.mjs",
+        "eslint.config.cjs",
+        ".eslintrc.js",
+        ".eslintrc.json",
+        ".eslintrc.yml",
+        ".eslintrc.yaml",
+    ]
+    for c in cfg_names:
+        p = os.path.join(target, c)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            continue
+        if (
+            "eslint-plugin-security" in content
+            or "plugin:security" in content
+            or '"security"' in content
+            or "'security'" in content
+        ):
+            return True
+    return False
+
+
+def _default_out_dir(target):
+    """Choose a results directory OUTSIDE the target tree.
+
+    P0: the results dir holds raw scanner output — including Bandit's `code`
+    snippet and SARIF `region.snippet` — which carry the offending source line.
+    That line is exactly where hardcoded credentials live, so writing it into
+    the scanned project turns a security tool's output into a secret-on-disk.
+    Default to ~/.tiangang/scans/<ts>-<basename>/ and fall back to a system
+    temp dir if home is not writable. ``--out`` still overrides.
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    tname = os.path.basename(os.path.abspath(target)) or "target"
+    primary = os.path.join(
+        os.path.expanduser("~"), ".tiangang", "scans", f"{ts}-{tname}"
+    )
+    try:
+        os.makedirs(primary, exist_ok=True)
+        # makedirs can succeed on a read-only-but-existing parent; verify with
+        # a write probe so we fall through to /tmp instead of failing mid-scan.
+        probe = os.path.join(primary, ".write-probe")
+        with open(probe, "w") as f:
+            f.write("")
+        os.remove(probe)
+        return primary
+    except OSError:
+        return tempfile.mkdtemp(prefix=f"tiangang-{ts}-")
+
+
+def _run_concurrently(tasks):
+    """Run scanner thunks concurrently; return ran entries in planned order.
+
+    ``tasks`` is a list of (name, fn) where fn() -> list[ran_entry]. Completion
+    order is independent of output order: results are reindexed by their
+    position in ``tasks`` so the manifest is deterministic (stable across runs
+    and diffs). A thunk that raises is recorded as a single failed ran entry
+    rather than aborting the batch — mirrors run_tool's "never raises, log it"
+    contract so one crashed scanner doesn't sink the others.
+    """
+    ran = []
+    if not tasks:
+        return ran
+    n = min(_max_workers(), len(tasks))
+    results_by_idx = {}
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        futures = {ex.submit(fn): idx for idx, (_name, fn) in enumerate(tasks)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            name = tasks[idx][0]
+            try:
+                results_by_idx[idx] = list(fut.result())
+            except Exception as e:
+                results_by_idx[idx] = [
+                    {
+                        "tool": name,
+                        "command": "",
+                        "returncode": -3,
+                        "log_tail": f"[scanner task crashed] {type(e).__name__}: {e}",
+                    }
+                ]
+    for idx in sorted(results_by_idx):
+        ran.extend(results_by_idx[idx])
+    return ran
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("target")
-    parser.add_argument("--out", default=None, help="Results directory (default: <target>/.security-audit)")
-    parser.add_argument("--langs", default=None, help="Comma-separated language list; auto-detected if omitted")
-    parser.add_argument("--agent-rules", default=None,
-                        help="Path to agent antipattern Semgrep rules YAML (for LLM agent codebases)")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Results directory (default: ~/.tiangang/scans/<ts>-<name>/ — outside the "
+        "target tree, so source snippets / potential secrets don't land in the "
+        "scanned project). Override with a path to write elsewhere.",
+    )
+    parser.add_argument(
+        "--langs",
+        default=None,
+        help="Comma-separated language list; auto-detected if omitted",
+    )
+    parser.add_argument(
+        "--agent-rules",
+        default=None,
+        help="Path to agent antipattern Semgrep rules YAML (for LLM agent codebases)",
+    )
     args = parser.parse_args()
 
     target = os.path.abspath(args.target)
@@ -201,44 +438,81 @@ def main():
         print(f"error: {target} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    out_dir = os.path.abspath(args.out) if args.out else os.path.join(target, ".security-audit")
+    out_dir = os.path.abspath(args.out) if args.out else _default_out_dir(target)
     os.makedirs(out_dir, exist_ok=True)
 
     # T-P1-7: strip whitespace from each language token to avoid silent skip
-    langs = [x.strip() for x in args.langs.split(",") if x.strip()] if args.langs else detect_languages(target)
+    langs = (
+        [x.strip() for x in args.langs.split(",") if x.strip()]
+        if args.langs
+        else detect_languages(target)
+    )
     # T-P2-7: validate --langs against the supported set; unknown names are
     # warned and dropped rather than silently skipped (a typo like "pyton"
     # would otherwise produce a semgrep-only scan with no indication why).
     if args.langs:
         unknown = [l for l in langs if l not in SUPPORTED_LANGS]
         for u in unknown:
-            print(f"warning: unsupported language '{u}' — skipping "
-                  f"(supported: {', '.join(sorted(SUPPORTED_LANGS))})", file=sys.stderr)
+            print(
+                f"warning: unsupported language '{u}' — skipping "
+                f"(supported: {', '.join(sorted(SUPPORTED_LANGS))})",
+                file=sys.stderr,
+            )
         langs = [l for l in langs if l in SUPPORTED_LANGS]
     print(f"Languages: {langs or '(none detected — semgrep only)'}")
 
-    ran = []
+    # Build the scan plan: each present tool becomes a thunk (runs concurrently
+    # in _run_concurrently); each absent tool becomes a static skipped entry.
+    # Order here is preserved in the manifest via task-index reassembly.
+    tasks = []  # list of (name, thunk) — thunk() -> list[ran_entry]
     skipped = []
 
     # Universal: semgrep
     if have("semgrep"):
-        _run_semgrep(target, out_dir, ran, agent_rules=args.agent_rules)
+        tasks.append(("semgrep", _semgrep_thunk(target, out_dir, args.agent_rules)))
     else:
-        skipped.append({"tool": "semgrep", "reason": "not installed — run install_tools.sh"})
+        skipped.append(
+            {"tool": "semgrep", "reason": "not installed — run install_tools.sh"}
+        )
 
     if "python" in langs:
         if have("bandit"):
             j = os.path.join(out_dir, "bandit.json")
-            run_tool("bandit", ran,
-                     ["bandit", "-r", target, "-f", "json", "-o", j, "-x", "*/tests/*,*/venv/*,*/.venv/*"])
+            tasks.append(
+                (
+                    "bandit",
+                    _tool_thunk(
+                        "bandit",
+                        [
+                            "bandit",
+                            "-r",
+                            target,
+                            "-f",
+                            "json",
+                            "-o",
+                            j,
+                            "-x",
+                            "*/tests/*,*/venv/*,*/.venv/*",
+                        ],
+                    ),
+                )
+            )
         else:
             skipped.append({"tool": "bandit", "reason": "not installed"})
 
     if "go" in langs:
         if have("gosec"):
             sarif = os.path.join(out_dir, "gosec.sarif")
-            run_tool("gosec", ran,
-                     ["gosec", "-fmt=sarif", f"-out={sarif}", "./..."], cwd=target)
+            tasks.append(
+                (
+                    "gosec",
+                    _tool_thunk(
+                        "gosec",
+                        ["gosec", "-fmt=sarif", f"-out={sarif}", "./..."],
+                        cwd=target,
+                    ),
+                )
+            )
         else:
             skipped.append({"tool": "gosec", "reason": "not installed"})
 
@@ -246,16 +520,38 @@ def main():
         if have("flawfinder"):
             sarif = os.path.join(out_dir, "flawfinder.sarif")
             # flawfinder writes SARIF to stdout; redirect via output_file
-            run_tool("flawfinder", ran,
-                     ["flawfinder", "--sarif", target], output_file=sarif)
+            tasks.append(
+                (
+                    "flawfinder",
+                    _tool_thunk(
+                        "flawfinder",
+                        ["flawfinder", "--sarif", target],
+                        output_file=sarif,
+                    ),
+                )
+            )
         else:
             skipped.append({"tool": "flawfinder", "reason": "not installed"})
         if have("cppcheck"):
             xml = os.path.join(out_dir, "cppcheck.xml")
             # cppcheck writes XML to stderr; redirect via output_stream="stderr"
-            run_tool("cppcheck", ran,
-                     ["cppcheck", "--enable=warning,portability", "--xml", "--xml-version=2", target],
-                     output_file=xml, output_stream="stderr")
+            tasks.append(
+                (
+                    "cppcheck",
+                    _tool_thunk(
+                        "cppcheck",
+                        [
+                            "cppcheck",
+                            "--enable=warning,portability",
+                            "--xml",
+                            "--xml-version=2",
+                            target,
+                        ],
+                        output_file=xml,
+                        output_stream="stderr",
+                    ),
+                )
+            )
         else:
             skipped.append({"tool": "cppcheck", "reason": "not installed"})
 
@@ -263,12 +559,22 @@ def main():
         # T-P2-12: brakeman exits non-zero on non-Ruby projects; skip if no
         # Ruby code is present rather than producing a misleading "failed" entry.
         if not _has_ruby_code(target):
-            skipped.append({"tool": "brakeman",
-                            "reason": "no Ruby files or Gemfile found — brakeman only works on Ruby projects"})
+            skipped.append(
+                {
+                    "tool": "brakeman",
+                    "reason": "no Ruby files or Gemfile found — brakeman only works on Ruby projects",
+                }
+            )
         elif have("brakeman"):
             sarif = os.path.join(out_dir, "brakeman.sarif")
-            run_tool("brakeman", ran,
-                     ["brakeman", "-f", "sarif", "-o", sarif, target])
+            tasks.append(
+                (
+                    "brakeman",
+                    _tool_thunk(
+                        "brakeman", ["brakeman", "-f", "sarif", "-o", sarif, target]
+                    ),
+                )
+            )
         else:
             skipped.append({"tool": "brakeman", "reason": "not installed"})
 
@@ -276,27 +582,117 @@ def main():
         if have("psalm") or os.path.exists(os.path.join(target, "vendor/bin/psalm")):
             sarif = os.path.join(out_dir, "psalm.sarif")
             psalm_cmd = "psalm" if have("psalm") else "vendor/bin/psalm"
-            run_tool("psalm", ran,
-                     [psalm_cmd, "--taint-analysis", f"--report={sarif}"], cwd=target)
+            tasks.append(
+                (
+                    "psalm",
+                    _tool_thunk(
+                        "psalm",
+                        [psalm_cmd, "--taint-analysis", f"--report={sarif}"],
+                        cwd=target,
+                    ),
+                )
+            )
         else:
-            skipped.append({"tool": "psalm", "reason": "not installed or no composer.json — relying on semgrep's PHP ruleset"})
+            skipped.append(
+                {
+                    "tool": "psalm",
+                    "reason": "not installed or no composer.json — relying on semgrep's PHP ruleset",
+                }
+            )
 
     if "java" in langs:
-        skipped.append({"tool": "findsecbugs", "reason": "needs project-specific build wiring — see references/tools.md, not auto-run"})
+        skipped.append(
+            {
+                "tool": "findsecbugs",
+                "reason": "needs project-specific build wiring — see references/tools.md, not auto-run",
+            }
+        )
 
     if "dotnet" in langs:
-        skipped.append({"tool": "security-code-scan", "reason": "Roslyn analyzer, needs to be added to the .csproj — see references/tools.md, not auto-run"})
+        skipped.append(
+            {
+                "tool": "security-code-scan",
+                "reason": "Roslyn analyzer, needs to be added to the .csproj — see references/tools.md, not auto-run",
+            }
+        )
 
     if "rust" in langs:
         # T-P1-1: cargo-audit is a separate crate; check `cargo audit --version` not just `cargo`
         if _cargo_audit_available():
             j = os.path.join(out_dir, "cargo-audit.json")
-            run_tool("cargo-audit", ran,
-                     ["cargo", "audit", "--json"], cwd=target, output_file=j)
+            tasks.append(
+                (
+                    "cargo-audit",
+                    _tool_thunk(
+                        "cargo-audit",
+                        ["cargo", "audit", "--json"],
+                        cwd=target,
+                        output_file=j,
+                    ),
+                )
+            )
         else:
-            skipped.append({"tool": "cargo-audit", "reason": "not installed — run `cargo install cargo-audit`"})
+            skipped.append(
+                {
+                    "tool": "cargo-audit",
+                    "reason": "not installed — run `cargo install cargo-audit`",
+                }
+            )
         # Miri only worth it if there's unsafe code; leave to the caller/skill instructions
         # to decide since it's slow and needs a nightly toolchain.
+
+    if "javascript" in langs:
+        # njsscan: standalone Python CLI, non-intrusive, SARIF to stdout.
+        if have("njsscan"):
+            sarif = os.path.join(out_dir, "njsscan.sarif")
+            tasks.append(
+                (
+                    "njsscan",
+                    _tool_thunk(
+                        "njsscan", ["njsscan", "--sarif", target], output_file=sarif
+                    ),
+                )
+            )
+        else:
+            skipped.append(
+                {
+                    "tool": "njsscan",
+                    "reason": "not installed — run install_tools.sh javascript (uv tool install njsscan)",
+                }
+            )
+        # eslint-plugin-security: requires project-local config + the plugin as
+        # a devDependency. Run only when wired; otherwise skip with guidance.
+        # --no-install refuses silent downloads; -o writes the JSON report.
+        if _eslint_security_configured(target):
+            out_json = os.path.join(out_dir, "eslint-security.json")
+            tasks.append(
+                (
+                    "eslint-security",
+                    _tool_thunk(
+                        "eslint-security",
+                        [
+                            "npx",
+                            "--no-install",
+                            "eslint",
+                            "--format",
+                            "json",
+                            "--output-file",
+                            out_json,
+                            ".",
+                        ],
+                        cwd=target,
+                    ),
+                )
+            )
+        else:
+            skipped.append(
+                {
+                    "tool": "eslint-security",
+                    "reason": "eslint config not found or eslint-plugin-security not wired — see references/tools.md (npm install --save-dev eslint eslint-plugin-security, then add 'security' to plugins)",
+                }
+            )
+
+    ran = _run_concurrently(tasks)
 
     manifest = {
         "target": target,
@@ -315,6 +711,9 @@ def main():
         print(f"  skipped: {s['tool']} — {s['reason']}")
     print(f"\nResults + manifest written to {out_dir}")
     print(f"Next: python3 {os.path.join(SCRIPT_DIR, 'generate_report.py')} {out_dir!r}")
+    print(
+        f"      python3 {os.path.join(SCRIPT_DIR, 'sarif_report.py')} {out_dir!r} --output {os.path.join(out_dir, 'report.sarif')}"
+    )
 
 
 if __name__ == "__main__":

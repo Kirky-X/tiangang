@@ -13,14 +13,12 @@ temp
 .Trashes
 ehthumbs.db
 Thumbs.db
-
 # IDE
 .vscode
 .idea
 *.swp
 *.swo
 *~
-
 # Python
 __pycache__/
 *.py[cod]
@@ -30,33 +28,31 @@ __pycache__/
 build/
 dist/
 *.egg-info/
-
 # Node
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-
 # 环境变量
 .env
 .env.local
 .env.*.local
-
 # 日志
 *.log
-
 # Meta
 .meta
-
 # 扫描产物
 .security-audit
-
 # 测试代码（开发期使用，不入仓库）
 tests/
 **/tests/
 **/test/
-
 # Darwin skill 优化产物（开发期使用，不入仓库）
 results.tsv
 test-prompts.json
 darwin-result-card.png
+# Python cache
+*.pyc
+.pytest_cache/
+.ruff_cache/
+# Specmark/openspec 临时产物

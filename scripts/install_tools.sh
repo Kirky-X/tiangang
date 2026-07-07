@@ -24,7 +24,7 @@ if [[ ${#LANGS[@]} -eq 0 ]]; then
   exit 1
 fi
 if [[ "${LANGS[0]}" == "all" ]]; then
-  LANGS=(python java go c_cpp ruby php dotnet rust)
+  LANGS=(python java go c_cpp ruby php dotnet rust javascript)
 fi
 
 STATUS_OK=0
@@ -91,6 +91,23 @@ for lang in "${LANGS[@]}"; do
         check_or_install "miri" "cargo +nightly miri --version" "rustup +nightly component add miri"
       else
         echo "SKIP      miri (no 'unsafe' blocks found — not worth the nightly toolchain setup)"
+      fi
+      ;;
+    javascript)
+      # njsscan is a standalone Python CLI (non-intrusive) — auto-install.
+      check_or_install "njsscan" "command -v njsscan" "uv tool install njsscan"
+      # eslint-plugin-security requires project-local config (eslint.config.js
+      # + the plugin) and would otherwise modify the user's package.json.
+      # Mirror the findsecbugs/security-code-scan pattern: detect a wired
+      # setup, else print the wiring step rather than silently skipping.
+      if [[ -f "$TARGET/package.json" ]] && { [[ -f "$TARGET/eslint.config.js" ]] || [[ -f "$TARGET/eslint.config.mjs" ]] || [[ -f "$TARGET/.eslintrc.js" ]] || [[ -f "$TARGET/.eslintrc.json" ]]; }; then
+        if grep -rqE "eslint-plugin-security|plugin:security" "$TARGET/eslint.config.js" "$TARGET/eslint.config.mjs" "$TARGET/.eslintrc.js" "$TARGET/.eslintrc.json" 2>/dev/null; then
+          echo "OK        eslint-plugin-security (configured in project)"
+        else
+          echo "SKIP      eslint-plugin-security (eslint config found but plugin not wired — run: npm install --save-dev eslint eslint-plugin-security, then add 'security' to your eslint config extends/plugins)"
+        fi
+      else
+        echo "SKIP      eslint-plugin-security (no eslint config + package.json in $TARGET — add via 'npm install --save-dev eslint eslint-plugin-security', see references/tools.md)"
       fi
       ;;
     *)

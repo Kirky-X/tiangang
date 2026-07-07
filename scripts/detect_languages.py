@@ -13,6 +13,7 @@ Exits with the detected languages printed one per line (or as JSON with
 this script reports all of them above a small noise threshold rather than
 just the dominant one.
 """
+
 import argparse
 import json
 import os
@@ -23,29 +24,65 @@ EXT_MAP = {
     ".py": "python",
     ".java": "java",
     ".go": "go",
-    ".c": "c_cpp", ".h": "c_cpp", ".cpp": "c_cpp", ".hpp": "c_cpp", ".cc": "c_cpp", ".cxx": "c_cpp",
+    ".c": "c_cpp",
+    ".h": "c_cpp",
+    ".cpp": "c_cpp",
+    ".hpp": "c_cpp",
+    ".cc": "c_cpp",
+    ".cxx": "c_cpp",
     ".rb": "ruby",
     ".php": "php",
     ".cs": "dotnet",
     ".rs": "rust",
+    # JavaScript / TypeScript share the "javascript" language bucket and the
+    # same scanner set (njsscan + eslint-plugin-security). TypeScript's type
+    # system does not change which SAST tools apply, so both go to one language.
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".ts": "javascript",
+    ".tsx": "javascript",
+    ".mts": "javascript",
+    ".cts": "javascript",
 }
 
 # manifest file (relative to a directory) -> language, treated as a strong
 # signal — one hit is enough to include the language regardless of file count
 MANIFEST_MAP = {
-    "requirements.txt": "python", "pyproject.toml": "python", "setup.py": "python", "Pipfile": "python",
-    "pom.xml": "java", "build.gradle": "java", "build.gradle.kts": "java",
+    "requirements.txt": "python",
+    "pyproject.toml": "python",
+    "setup.py": "python",
+    "Pipfile": "python",
+    "pom.xml": "java",
+    "build.gradle": "java",
+    "build.gradle.kts": "java",
     "go.mod": "go",
     "Gemfile": "ruby",
     "composer.json": "php",
     "Cargo.toml": "rust",
+    # JS/TS manifest files — package.json covers Node/JS/TS; tsconfig.json is a
+    # strong TypeScript signal even when .ts file count is low.
+    "package.json": "javascript",
+    "package-lock.json": "javascript",
+    "tsconfig.json": "javascript",
 }
 
 # directories that would otherwise pollute the extension counts with
 # vendored / generated code that isn't the user's own
 SKIP_DIRS = {
-    ".git", "node_modules", "vendor", "venv", ".venv", "__pycache__",
-    "target", "dist", "build", ".tox", "bin", "obj",
+    ".git",
+    "node_modules",
+    "vendor",
+    "venv",
+    ".venv",
+    "__pycache__",
+    "target",
+    "dist",
+    "build",
+    ".tox",
+    "bin",
+    "obj",
 }
 
 # extension-count threshold below which we treat a language as noise (e.g.
@@ -92,20 +129,33 @@ def main():
 
     if not ordered:
         if args.json:
-            print(json.dumps({"languages": [], "file_counts": {}, "manifest_matches": []}))
+            print(
+                json.dumps({"languages": [], "file_counts": {}, "manifest_matches": []})
+            )
         else:
-            print("No supported language detected. Falling back to semgrep (language-agnostic) only.")
+            print(
+                "No supported language detected. Falling back to semgrep (language-agnostic) only."
+            )
         return
 
     if args.json:
-        print(json.dumps({
-            "languages": ordered,
-            "file_counts": ext_counts,
-            "manifest_matches": strong,
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "languages": ordered,
+                    "file_counts": ext_counts,
+                    "manifest_matches": strong,
+                },
+                indent=2,
+            )
+        )
     else:
         for lang in ordered:
-            marker = " (manifest file found)" if lang in strong else f" ({ext_counts.get(lang, 0)} files)"
+            marker = (
+                " (manifest file found)"
+                if lang in strong
+                else f" ({ext_counts.get(lang, 0)} files)"
+            )
             print(f"{lang}{marker}")
 
 

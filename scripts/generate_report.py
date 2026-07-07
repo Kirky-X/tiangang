@@ -6,12 +6,28 @@ file. Handles SARIF (semgrep, gosec, flawfinder, brakeman, psalm, codeql),
 Bandit JSON, Cppcheck XML, and cargo-audit JSON. Add a parser here for any
 new tool wired into run_scan.py or referenced in tools.md.
 
+Each finding carries optional remediation metadata when the upstream tool
+provides it:
+  - ``cwe`` / ``cwe_url``: extracted from SARIF rule ``properties.tags`` (e.g.
+    semgrep emits ``["security","cwe-78","owasp-a1"]``) or Bandit's
+    ``issue_cwe`` object. Renders as a link to cwe.mitre.org.
+  - ``fix``: extracted from SARIF ``result.fixes[].description.text`` (Semgrep
+    emits these when a rule ships an autofix). Rendered inline.
+
+Security: every string field is run through ``redact.redact_secrets`` before
+the report is written, so a hardcoded credential surfacing inside a SARIF
+``region.snippet`` or a Bandit ``code`` value cannot land on disk via the
+report. This is the P0 secret-on-disk mitigation for the report path.
+
 Usage:
     python3 generate_report.py <results-dir> [--out report.md]
 """
+
 import argparse
 import json
 import os
+import re
+import sys
 from collections import defaultdict
 
 try:
@@ -19,8 +35,72 @@ try:
 except ImportError:
     import xml.etree.ElementTree as ET
 
+# redact.py lives next to this script. Importing it means the secret
+# redaction rules have a single source of truth (no second copy here).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from redact import redact_secrets  # noqa: E402
+
 SEVERITY_ORDER = ["critical", "high", "medium", "low", "info", "unknown"]
 SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
+
+# Match "cwe-78", "cwe/89", "CWE_1234", "cwe 22" anywhere in a tag/id.
+# Used on the union of rule.tags / rule.id / bandit test_id to recover the
+# CWE reference each tool emits in its own dialect.
+_CWE_RE = re.compile(r"cwe[-_/ ]?(\d{1,5})", re.IGNORECASE)
+
+
+def _cwe_from_iterable(values):
+    """Return the first CWE id (e.g. "CWE-78") found in an iterable of strings.
+
+    Tools are inconsistent — semgrep puts "cwe-78" in properties.tags, gosec
+    uses "G104" ids, flawfinder embeds the CWE in rule metadata. Walk whatever
+    iterable the caller hands us and return the first plausible match; None
+    when nothing looks like a CWE.
+    """
+    if not values:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    for v in values:
+        if not isinstance(v, str):
+            continue
+        m = _CWE_RE.search(v)
+        if m:
+            num = int(m.group(1))
+            if 1 <= num <= 2000:  # guard against nonsense like "cwe-99999"
+                return f"CWE-{num}"
+    return None
+
+
+def _cwe_url(cwe_id):
+    """Map "CWE-78" → "https://cwe.mitre.org/data/definitions/78.html"."""
+    if not cwe_id:
+        return None
+    m = re.search(r"(\d+)", cwe_id)
+    if not m:
+        return None
+    return f"https://cwe.mitre.org/data/definitions/{int(m.group(1))}.html"
+
+
+def _fix_from_sarif_result(result, rule):
+    """Extract a human-readable fix string from a SARIF result/rule pair.
+
+    Semgrep emits autofixes under ``result.fixes[].description.text``. Some
+    tools instead annotate the rule (``rule.properties.fix``). Prefer the
+    per-result fix (specific to this occurrence) and fall back to the rule.
+    Returns "" when neither is present — most rules don't carry a fix.
+    """
+    for fix in result.get("fixes", []) or []:
+        desc = fix.get("description", {})
+        text = desc.get("text") if isinstance(desc, dict) else None
+        if text:
+            return text
+    props = rule.get("properties", {}) if isinstance(rule, dict) else {}
+    if isinstance(props, dict):
+        rule_fix = props.get("fix")
+        if isinstance(rule_fix, str) and rule_fix.strip():
+            return rule_fix.strip()
+    return ""
 
 
 def norm_severity(raw):
@@ -28,13 +108,24 @@ def norm_severity(raw):
         return "unknown"
     s = str(raw).strip().lower()
     mapping = {
-        "error": "high", "warning": "medium", "note": "low",
-        "blocker": "critical", "critical": "critical",
-        "high": "high", "medium": "medium", "moderate": "medium",
-        "low": "low", "info": "info", "informational": "info",
+        "error": "high",
+        "warning": "medium",
+        "note": "low",
+        "blocker": "critical",
+        "critical": "critical",
+        "high": "high",
+        "medium": "medium",
+        "moderate": "medium",
+        "low": "low",
+        "info": "info",
+        "informational": "info",
         # cppcheck severity values: error/warning/style/performance/portability
-        "style": "low", "performance": "low", "portability": "low",
-        "1": "low", "2": "medium", "3": "high",  # cppcheck-style numeric/verbosity fallback
+        "style": "low",
+        "performance": "low",
+        "portability": "low",
+        "1": "low",
+        "2": "medium",
+        "3": "high",  # cppcheck-style numeric/verbosity fallback
     }
     return mapping.get(s, s if s in SEVERITY_ORDER else "unknown")
 
@@ -74,15 +165,38 @@ def parse_sarif(path, tool_name):
                 else:
                     rule_id = "unknown-rule"
             rule = rules.get(rule_id, {})
-            level = result.get("level") or rule.get("defaultConfiguration", {}).get("level")
+            level = result.get("level") or rule.get("defaultConfiguration", {}).get(
+                "level"
+            )
             msg = result.get("message", {}).get("text", "")
             loc = (result.get("locations") or [{}])[0].get("physicalLocation", {})
             file_path = loc.get("artifactLocation", {}).get("uri", "unknown file")
             line = loc.get("region", {}).get("startLine", "?")
-            findings.append({
-                "tool": tool_name, "rule": rule_id, "severity": norm_severity(level),
-                "file": file_path, "line": line, "message": msg,
-            })
+            # P1.4: recover CWE + autofix metadata when the tool emits them.
+            # properties.tags is the SARIF convention (semgrep, codeql, gosec
+            # all populate it); rule.id is a fallback some tools use instead.
+            props = rule.get("properties", {}) if isinstance(rule, dict) else {}
+            tag_sources = []
+            if isinstance(props, dict):
+                tag_sources.append(props.get("tags"))
+                tag_sources.append(props.get("cwe"))
+            tag_sources.append(rule_id)
+            cwe = _cwe_from_iterable(tag_sources)
+            finding = {
+                "tool": tool_name,
+                "rule": rule_id,
+                "severity": norm_severity(level),
+                "file": file_path,
+                "line": line,
+                "message": msg,
+            }
+            if cwe:
+                finding["cwe"] = cwe
+                finding["cwe_url"] = _cwe_url(cwe)
+            fix = _fix_from_sarif_result(result, rule)
+            if fix:
+                finding["fix"] = fix
+            findings.append(finding)
     return findings, None
 
 
@@ -94,12 +208,22 @@ def parse_bandit(path):
     except Exception as e:
         return [], f"could not parse {path}: {e}"
     for r in data.get("results", []):
-        findings.append({
-            "tool": "bandit", "rule": r.get("test_id", "unknown"),
+        finding = {
+            "tool": "bandit",
+            "rule": r.get("test_id", "unknown"),
             "severity": norm_severity(r.get("issue_severity")),
-            "file": r.get("filename", "unknown file"), "line": r.get("line_number", "?"),
+            "file": r.get("filename", "unknown file"),
+            "line": r.get("line_number", "?"),
             "message": r.get("issue_text", ""),
-        })
+        }
+        # P1.4: Bandit ships issue_cwe as {"id": <int>, "link": "<url>"}.
+        # Map to the same cwe/cwe_url shape used by parse_sarif so the
+        # renderer and SARIF aggregator share one code path.
+        cwe_obj = r.get("issue_cwe") or {}
+        if isinstance(cwe_obj, dict) and cwe_obj.get("id"):
+            finding["cwe"] = f"CWE-{int(cwe_obj['id'])}"
+            finding["cwe_url"] = cwe_obj.get("link") or _cwe_url(finding["cwe"])
+        findings.append(finding)
     return findings, None
 
 
@@ -113,12 +237,20 @@ def parse_cppcheck(path):
         sev = err.get("severity", "unknown")
         msg = err.get("msg", "")
         loc = err.find("location")
-        file_path = loc.get("file", "unknown file") if loc is not None else "unknown file"
+        file_path = (
+            loc.get("file", "unknown file") if loc is not None else "unknown file"
+        )
         line = loc.get("line", "?") if loc is not None else "?"
-        findings.append({
-            "tool": "cppcheck", "rule": err.get("id", "unknown"),
-            "severity": norm_severity(sev), "file": file_path, "line": line, "message": msg,
-        })
+        findings.append(
+            {
+                "tool": "cppcheck",
+                "rule": err.get("id", "unknown"),
+                "severity": norm_severity(sev),
+                "file": file_path,
+                "line": line,
+                "message": msg,
+            }
+        )
     return findings, None
 
 
@@ -134,12 +266,16 @@ def parse_cargo_audit(path):
         pkg = vuln.get("package", {})
         # RUSTSEC advisories: severity is optional; when absent, default to MEDIUM
         # (not HIGH — over-rating noise vulnerabilities drowns out real critical ones)
-        findings.append({
-            "tool": "cargo-audit", "rule": advisory.get("id", "unknown"),
-            "severity": norm_severity(advisory.get("severity") or "medium"),
-            "file": "Cargo.lock", "line": "?",
-            "message": f"{pkg.get('name', '?')} {pkg.get('version', '?')}: {advisory.get('title', '')}",
-        })
+        findings.append(
+            {
+                "tool": "cargo-audit",
+                "rule": advisory.get("id", "unknown"),
+                "severity": norm_severity(advisory.get("severity") or "medium"),
+                "file": "Cargo.lock",
+                "line": "?",
+                "message": f"{pkg.get('name', '?')} {pkg.get('version', '?')}: {advisory.get('title', '')}",
+            }
+        )
     return findings, None
 
 
@@ -159,13 +295,16 @@ def parse_security_code_scan(path):
         return [], f"could not parse {path}: {e}"
     items = data if isinstance(data, list) else data.get("results", [])
     for r in items:
-        findings.append({
-            "tool": "security-code-scan", "rule": r.get("ruleId", r.get("rule", "unknown")),
-            "severity": norm_severity(r.get("severity")),
-            "file": r.get("file", r.get("location", "unknown file")),
-            "line": r.get("line", "?"),
-            "message": r.get("message", ""),
-        })
+        findings.append(
+            {
+                "tool": "security-code-scan",
+                "rule": r.get("ruleId", r.get("rule", "unknown")),
+                "severity": norm_severity(r.get("severity")),
+                "file": r.get("file", r.get("location", "unknown file")),
+                "line": r.get("line", "?"),
+                "message": r.get("message", ""),
+            }
+        )
     return findings, None
 
 
@@ -191,13 +330,65 @@ def parse_miri_log(path):
                     if len(parts) >= 2:
                         file_path = parts[0]
                         line_no = parts[1]
-                findings.append({
-                    "tool": "miri", "rule": "undefined-behavior",
-                    "severity": "high", "file": file_path, "line": line_no,
-                    "message": line.split("error: Undefined Behavior:", 1)[-1].strip() if "error: Undefined Behavior:" in line else line.strip(),
-                })
+                findings.append(
+                    {
+                        "tool": "miri",
+                        "rule": "undefined-behavior",
+                        "severity": "high",
+                        "file": file_path,
+                        "line": line_no,
+                        "message": line.split("error: Undefined Behavior:", 1)[
+                            -1
+                        ].strip()
+                        if "error: Undefined Behavior:" in line
+                        else line.strip(),
+                    }
+                )
     except Exception as e:
         return [], f"could not parse {path}: {e}"
+    return findings, None
+
+
+def parse_eslint_security(path):
+    """Parse ESLint JSON output (eslint --format json) for security findings.
+
+    The standard eslint JSON formatter emits a list of per-file result objects:
+      [{"filePath": "/abs", "messages": [{"ruleId": "security/detect-eval-with-expression",
+        "severity": 2, "message": "...", "line": 42, "column": 5}], ...}]
+    severity 1 = warning, 2 = error. Only messages carrying a `security/*`
+    ruleId are real findings — without that filter, a project's whole eslint
+    output (style, import order, etc.) would flood the report. We surface the
+    rest of eslint by skipping non-security rules here.
+    """
+    findings = []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return [], f"could not parse {path}: {e}"
+    if not isinstance(data, list):
+        return [], f"unexpected eslint json shape in {path} (expected list)"
+    for file_entry in data:
+        if not isinstance(file_entry, dict):
+            continue
+        file_path = file_entry.get("filePath") or "unknown file"
+        for msg in file_entry.get("messages", []) or []:
+            rule_id = msg.get("ruleId") or "unknown"
+            # Only collect eslint-plugin-security findings — eslint output
+            # otherwise carries every lint rule the project configured.
+            if not rule_id.startswith("security/"):
+                continue
+            sev = "high" if msg.get("severity") == 2 else "low"
+            findings.append(
+                {
+                    "tool": "eslint-security",
+                    "rule": rule_id,
+                    "severity": norm_severity(sev),
+                    "file": file_path,
+                    "line": msg.get("line", "?"),
+                    "message": msg.get("message", ""),
+                }
+            )
     return findings, None
 
 
@@ -210,10 +401,12 @@ PARSERS = {
     "brakeman.sarif": (lambda p: parse_sarif(p, "brakeman"), "brakeman"),
     "psalm.sarif": (lambda p: parse_sarif(p, "psalm"), "psalm"),
     "findsecbugs.sarif": (lambda p: parse_sarif(p, "findsecbugs"), "findsecbugs"),
+    "njsscan.sarif": (lambda p: parse_sarif(p, "njsscan"), "njsscan"),
     "bandit.json": (parse_bandit, "bandit"),
     "cppcheck.xml": (parse_cppcheck, "cppcheck"),
     "cargo-audit.json": (parse_cargo_audit, "cargo-audit"),
     "security-code-scan.json": (parse_security_code_scan, "security-code-scan"),
+    "eslint-security.json": (parse_eslint_security, "eslint-security"),
     "miri.log": (parse_miri_log, "miri"),
 }
 
@@ -247,13 +440,25 @@ def collect_findings(results_dir):
             continue
         seen.add(key)
         deduped.append(f)
+    # P0.6: redact known secret shapes from any free-text field before the
+    # report is written. A hardcoded credential surfacing in a SARIF message
+    # or a Bandit issue_text would otherwise turn the report itself into a
+    # secret-on-disk. redact_secrets is a no-op when no pattern matches, so
+    # findings without secret-shaped content are unchanged.
+    for f in deduped:
+        if isinstance(f.get("message"), str):
+            f["message"] = redact_secrets(f["message"])
+        if isinstance(f.get("fix"), str):
+            f["fix"] = redact_secrets(f["fix"])
     return deduped, parse_errors
 
 
 def render_report(results_dir, findings, parse_errors, manifest):
     lines = ["# Security audit report", ""]
     lines.append(f"Target: `{manifest.get('target', results_dir)}`  ")
-    lines.append(f"Languages scanned: {', '.join(manifest.get('languages', [])) or '(none detected)'}  ")
+    lines.append(
+        f"Languages scanned: {', '.join(manifest.get('languages', [])) or '(none detected)'}  "
+    )
     lines.append(f"Generated: {manifest.get('timestamp', '')}")
     lines.append("")
 
@@ -274,8 +479,10 @@ def render_report(results_dir, findings, parse_errors, manifest):
     if skipped:
         lines.append("## Tools not run")
         lines.append("")
-        lines.append("These weren't installed or weren't applicable, so their coverage is missing "
-                      "from this report — treat the findings below as partial, not exhaustive.")
+        lines.append(
+            "These weren't installed or weren't applicable, so their coverage is missing "
+            "from this report — treat the findings below as partial, not exhaustive."
+        )
         lines.append("")
         for s in skipped:
             lines.append(f"- **{s['tool']}**: {s['reason']}")
@@ -287,13 +494,17 @@ def render_report(results_dir, findings, parse_errors, manifest):
     if failed_tools:
         lines.append("## Tools attempted but failed")
         lines.append("")
-        lines.append("These tools were invoked but exited non-zero — their coverage is missing "
-                      "from the findings below. Treat the report as partial; investigate the "
-                      "failures before relying on a clean result.")
+        lines.append(
+            "These tools were invoked but exited non-zero — their coverage is missing "
+            "from the findings below. Treat the report as partial; investigate the "
+            "failures before relying on a clean result."
+        )
         lines.append("")
         for r in failed_tools:
             tail = r.get("log_tail", "")
-            lines.append(f"- **{r['tool']}** (exit {r['returncode']}): {tail[-300:] if tail else '(no output)'}")
+            lines.append(
+                f"- **{r['tool']}** (exit {r['returncode']}): {tail[-300:] if tail else '(no output)'}"
+            )
         lines.append("")
 
     if parse_errors:
@@ -304,12 +515,21 @@ def render_report(results_dir, findings, parse_errors, manifest):
         lines.append("")
 
     if not findings:
-        lines.append("No findings from the tools that ran. This does not guarantee the code is "
-                      "free of security issues — it reflects the coverage of the tools listed "
-                      "above, nothing more.")
+        lines.append(
+            "No findings from the tools that ran. This does not guarantee the code is "
+            "free of security issues — it reflects the coverage of the tools listed "
+            "above, nothing more."
+        )
         return "\n".join(lines)
 
-    findings_sorted = sorted(findings, key=lambda f: (SEVERITY_RANK.get(f["severity"], 99), f["file"], _line_sort_key(f["line"])))
+    findings_sorted = sorted(
+        findings,
+        key=lambda f: (
+            SEVERITY_RANK.get(f["severity"], 99),
+            f["file"],
+            _line_sort_key(f["line"]),
+        ),
+    )
 
     lines.append("## Findings")
     lines.append("")
@@ -321,7 +541,19 @@ def render_report(results_dir, findings, parse_errors, manifest):
             current_sev = f["severity"]
             lines.append(f"### {current_sev.capitalize()}")
             lines.append("")
-        lines.append(f"- **[{f['tool']}:{f['rule']}]** `{f['file']}:{f['line']}` — {f['message']}")
+        # P1.4: append CWE link and the tool-proffered fix inline, so a
+        # reviewer can both triage by weakness category and apply the
+        # remediation without leaving the report.
+        cwe_url = f.get("cwe_url")
+        if cwe_url and f.get("cwe"):
+            cwe_part = f" ([{f['cwe']}]({cwe_url}))"
+        else:
+            cwe_part = ""
+        lines.append(
+            f"- **[{f['tool']}:{f['rule']}]** `{f['file']}:{f['line']}` — {f['message']}{cwe_part}"
+        )
+        if f.get("fix"):
+            lines.append(f"  - **Fix:** {f['fix']}")
     lines.append("")
 
     return "\n".join(lines)
