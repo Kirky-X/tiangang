@@ -1,7 +1,8 @@
 # Tiangang (天罡) —— SAST 静态应用安全测试套件
 
-[![GitHub Release](https://img.shields.io/github/v/release/Kirky-X/tiangang?style=flat-square)](https://github.com/Kirky-X/tiangang/releases)
-[![GitHub License](https://img.shields.io/github/license/Kirky-X/tiangang?style=flat-square)](LICENSE)
+[English](README_EN.md)
+
+[![GitHub Release](https://img.shields.io/github/v/release/Kirky-X/tiangang?style=flat-square)](https://github.com/Kirky-X/tiangang/releases) [![GitHub License](https://img.shields.io/github/license/Kirky-X/tiangang?style=flat-square)](LICENSE)
 
 Tiangang 是一个面向 AI agent 的 SAST(static application security testing)skill,采用 agent-first 格式(YAML frontmatter + Markdown 工作流说明)。它通过四个脚本构成一条完整流水线:`detect_languages` 自动识别目标目录的语言,`install_tools` 检查并补齐缺失扫描器,`run_scan` 运行 Semgrep(语言无关,始终运行)+ 各语言专属扫描器,`generate_report` 将多种异构格式(SARIF/JSON/XML)统一为一份人类可读的 Markdown 报告。
 
