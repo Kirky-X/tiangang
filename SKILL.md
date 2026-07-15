@@ -11,7 +11,8 @@ license: MIT
 ## 详细说明
 
 支持的语言和工具：
-- **通用**：Semgrep（语言无关，始终运行）、CodeQL（深度扫描，opt-in）
+- **通用 SAST**：Semgrep（语言无关，始终运行）、CodeQL（深度扫描，opt-in）
+- **通用 SCA + 密钥扫描通道**（无论检测到哪些语言都运行）：Trivy（全生态依赖 CVE）、Gitleaks + Trufflehog（独立密钥扫描双通道，避免依赖 Semgrep `p/secrets` 单一通道）
 - **Python**：Bandit
 - **Java**：FindSecBugs
 - **Go**：Gosec
@@ -20,6 +21,7 @@ license: MIT
 - **PHP**：Psalm
 - **.NET**：Security Code Scan
 - **Rust**：cargo-audit / Miri
+- **JavaScript/TypeScript**：njsscan / retire.js / eslint-plugin-security
 
 整体流程：自动检测目标目录中的语言，指导安装缺失的工具，运行扫描并生成报告——不要让用户自己先说出工具名。
 
@@ -59,7 +61,11 @@ bash scripts/install_tools.sh <lang1> <lang2> ...     # or: bash scripts/install
 python3 scripts/run_scan.py <target-dir> [--out <results-dir>] [--langs python,go,...]
 ```
 
-运行 Semgrep（始终运行——语言无关，能捕获 hardcoded secrets 等各语言专属工具不查的问题）加上第 2 步中可用的语言专属工具。把每个工具的原始输出（SARIF 或 JSON，见 `references/tools.md`）写入 results 目录，同时写入 `scan_manifest.json` 记录哪些运行了、哪些被跳过。被跳过的工具不会让运行失败——带着"这里有什么没覆盖"的清晰说明的局部扫描，比拒绝产出任何东西更有用。
+运行 Semgrep（始终运行——语言无关，能捕获 hardcoded secrets 等各语言专属工具不查的问题）加上通用 SCA/密钥扫描通道（trivy/gitleaks/trufflehog，无论检测到哪些语言都运行）和第 2 步中可用的语言专属工具。把每个工具的原始输出（SARIF 或 JSON，见 `references/tools.md`）写入 results 目录，同时写入 `scan_manifest.json` 记录哪些运行了、哪些被跳过。被跳过的工具不会让运行失败——带着"这里有什么没覆盖"的清晰说明的局部扫描，比拒绝产出任何东西更有用。
+
+**密钥扫描双通道**:gitleaks 和 trufflehog 形成独立密钥检测通道,与 Semgrep `p/secrets` 规则集解耦 —— 单一通道 = 单点失败。两个工具的输出 parser 在 message 中**只保留 rule id / detector name / verified 标志**,绝不写入 `Secret`/`Match`/`Raw`/`Redacted` 原文,从 parser 层切断 secret-on-disk 路径(`redact.py` 是 defense in depth)。
+
+**SCA DB 陈旧信号**:trivy 在 DB 过期时返回零结果,而零结果在 DB 过期时是可疑信号而非"安全"。`run_scan.py` 把 `trivy version --format json` 写入 `trivy-version.json`,让 `VulnerabilityDB.UpdatedAt` 成为可见信号,报告可显式标注是否需要 `trivy db update`。
 
 对于实现 LLM agent 的代码库（LangChain、CrewAI、AutoGen、langgraph 等），在 `--config auto` 之外加载 agent 反模式 Semgrep 规则集，把 12-factor-agents 架构违规作为 SAST 信号捕获——规则说明见 `references/agent-semgrep-rules.md`，物化后的规则文件位于 `rules/agent-antipatterns.yml`。`run_scan.py` 支持 `--agent-rules` 开关自动加载该规则集，所以当目标看起来像 agent 代码时加上该开关即可，或单独跑一次 Semgrep。
 
@@ -71,7 +77,9 @@ python3 scripts/run_scan.py <target-dir> [--out <results-dir>] [--langs python,g
 python3 scripts/generate_report.py <results-dir> [--out report.md]
 ```
 
-解析 results 目录中的每个原始工具输出（SARIF、Bandit JSON、Cppcheck XML、cargo-audit JSON——如果接入新工具，扩展脚本中的 `PARSERS`），汇总成一份 Markdown 报告：按严重程度的汇总表、未运行工具的列表及原因、按严重程度再按文件分组的发现。把这份文件作为交付物呈现给用户——不要把原始工具输出粘到对话里，这一步的全部意义就是把五种工具各自奇奇怪怪的格式变成人类能读的一份东西。
+解析 results 目录中的每个原始工具输出（SARIF、Bandit JSON、Cppcheck XML、cargo-audit JSON、Trivy/Gitleaks/Trufflehog/Retire JSON/JSONL——如果接入新工具，扩展脚本中的 `PARSERS`），汇总成一份 Markdown 报告：按严重程度的汇总表、未运行工具的列表及原因、按严重程度再按文件分组的发现。把这份文件作为交付物呈现给用户——不要把原始工具输出粘到对话里，这一步的全部意义就是把五种工具各自奇奇怪怪的格式变成人类能读的一份东西。
+
+**密钥扫描输出的 secret-on-disk 防护**:gitleaks 的 `Secret`/`Match`、trufflehog 的 `Raw`/`Redacted` 字段携带凭证原文。`generate_report.py` 的 parser 在 message 中只保留 rule id / detector name / verified 标志,**绝不**把凭证原文写入报告 —— `redact.py` 的通用正则脱敏是 defense in depth,parser 层是第一道防线。这是一个 P0 安全要求:安全工具自身的输出不能成为 secret-on-disk 的载体。
 
 ## 报告之后
 

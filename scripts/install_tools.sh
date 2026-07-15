@@ -57,6 +57,15 @@ check_or_install() {
 # Semgrep is universal — always check it once regardless of which languages were requested.
 check_or_install "semgrep" "command -v semgrep" "uv tool install semgrep"
 
+# Universal SCA + secret channel (absorbed from strix's source-aware SAST
+# playbook). These run on every scan regardless of detected language —
+# trivy covers all ecosystems via lockfile scanning, gitleaks + trufflehog
+# form an independent secret-detection channel so hardcoded credentials
+# don't depend solely on semgrep's p/secrets ruleset.
+check_or_install "trivy" "command -v trivy" "curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin"
+check_or_install "gitleaks" "command -v gitleaks" "go install github.com/gitleaks/gitleaks/v8@latest"
+check_or_install "trufflehog" "command -v trufflehog" "go install github.com/trufflesecurity/trufflehog/v3@latest"
+
 for lang in "${LANGS[@]}"; do
   case "$lang" in
     python)
@@ -96,6 +105,11 @@ for lang in "${LANGS[@]}"; do
     javascript)
       # njsscan is a standalone Python CLI (non-intrusive) — auto-install.
       check_or_install "njsscan" "command -v njsscan" "uv tool install njsscan"
+      # retire.js: scans for known-CVE versions of frontend/Node libraries
+      # (jquery, lodash, …) that ship in the project. Complements trivy's
+      # npm lockfile scan by catching vendored/minified copies. Absorbed
+      # from strix's source-aware SAST playbook.
+      check_or_install "retire" "command -v retire" "npm install -g retire"
       # eslint-plugin-security requires project-local config (eslint.config.js
       # + the plugin) and would otherwise modify the user's package.json.
       # Mirror the findsecbugs/security-code-scan pattern: detect a wired

@@ -55,4 +55,6 @@ darwin-result-card.png
 *.pyc
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 # Specmark/openspec 临时产物

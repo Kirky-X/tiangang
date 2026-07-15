@@ -20,12 +20,16 @@ Tiangang 是一个面向 AI agent 的 SAST(static application security testing)s
   - PHP → **Psalm**(composer 集成)
   - .NET → **Security Code Scan**(Roslyn 分析器)
   - Rust → **cargo-audit** + **Miri**
-- **2 种通用扫描器** —— 语言无关,覆盖跨语言模式:
+  - JavaScript/TypeScript → **njsscan** + **retire.js** + **eslint-plugin-security**
+- **通用 SCA + 密钥扫描通道** —— 无论检测到哪些语言都运行(吸收自 strix source-aware SAST playbook):
+  - **Trivy** —— 全生态依赖 CVE 扫描,覆盖 npm/pip/go/cargo/maven 等主流生态;DB 陈旧信号物化到 `trivy-version.json`,零结果不再误导为"安全"
+  - **Gitleaks** + **Trufflehog** —— 独立密钥扫描双通道,与 Semgrep `p/secrets` 规则集解耦(单一通道 = 单点失败);parser 层切断 secret-on-disk 路径,`Secret`/`Match`/`Raw`/`Redacted` 原文绝不进报告
+- **2 种通用 SAST 扫描器** —— 语言无关,覆盖跨语言模式:
   - **Semgrep** —— 始终运行,捕获硬编码密钥、不安全反序列化等模式
   - **CodeQL** —— 可选深度扫描,需构建查询数据库,见 `references/codeql.md`
 - **4 步工作流** —— 检测 → 安装 → 扫描 → 报告,各步骤输出作为下一步输入
 - **多语言项目支持** —— 自动发现所有语言(如 Python 后端 + Go sidecar),全部扫描而非只扫主导语言
-- **统一报告** —— 五种工具的异构输出格式(SARIF/JSON/XML)归并为一份按严重级别分组的 Markdown 报告
+- **统一报告** —— 多种工具的异构输出格式(SARIF/JSON/XML/JSONL)归并为一份按严重级别分组的 Markdown 报告
 - **失败显性化** —— 工具缺失、安装失败、扫描被跳过都会在报告中明确标注原因,而非静默"成功"
 - **清洁扫描不等于安全** —— 报告中明确区分"实际检查范围"与"无漏洞保证",避免误导
 
@@ -143,8 +147,8 @@ flowchart TD
 
 1. `detect_languages` 通过 manifest 文件(`requirements.txt`、`go.mod`、`Cargo.toml` 等,强信号)+ 扩展名计数(弱信号,经最低文件数阈值过滤)返回所有高于噪声阈值的语言
 2. `install_tools` 检查每个相关工具,只安装缺失的;对于无法自动安装的工具(FindSecBugs / Security Code Scan / Psalm)打印操作指引而非静默跳过
-3. `run_scan` 始终运行 Semgrep(语言无关,捕获硬编码密钥等跨语言模式)+ 步骤 2 中可用的语言专属工具;写每个工具的原始输出与 `scan_manifest.json`(记录已运行/已跳过工具)
-4. `generate_report` 将 SARIF / Bandit JSON / Cppcheck XML / cargo-audit JSON 等异构格式解析为统一 Markdown:按严重级别的汇总表 + 未运行工具及原因清单 + 按严重级别再按文件分组的发现列表
+3. `run_scan` 始终运行 Semgrep(语言无关,捕获硬编码密钥等跨语言模式)+ 通用 SCA/密钥扫描通道(trivy/gitleaks/trufflehog,无论检测到哪些语言都运行)+ 步骤 2 中可用的语言专属工具;写每个工具的原始输出与 `scan_manifest.json`(记录已运行/已跳过工具)
+4. `generate_report` 将 SARIF / Bandit JSON / Cppcheck XML / cargo-audit JSON / Trivy JSON / Gitleaks JSON / Trufflehog JSONL / Retire JSON 等异构格式解析为统一 Markdown:按严重级别的汇总表 + 未运行工具及原因清单 + 按严重级别再按文件分组的发现列表。密钥扫描通道的 parser 在 message 中只保留 rule id / detector name,凭证原文(`Secret`/`Match`/`Raw`/`Redacted`)绝不进报告 —— `redact.py` 是 defense in depth
 
 ## FAQ
 

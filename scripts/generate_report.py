@@ -392,6 +392,231 @@ def parse_eslint_security(path):
     return findings, None
 
 
+def _cvss_to_severity(score):
+    """Map a CVSS v3 base score (0.0–10.0) to a tiangang severity bucket.
+
+    Uses the standard CVSS v3 severity bands so trivy findings without an
+    explicit Severity field still get a defensible rating rather than
+    defaulting to "unknown" and being buried at the bottom of the report.
+    """
+    if score is None:
+        return "unknown"
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return "unknown"
+    if s >= 9.0:
+        return "critical"
+    if s >= 7.0:
+        return "high"
+    if s >= 4.0:
+        return "medium"
+    return "low"
+
+
+def _trivy_cvss_score(vuln):
+    """Extract a numeric CVSS v3 score from a trivy vulnerability entry.
+
+    trivy nests the score under any of several vendor keys (nvd, redhat,
+    ghsa, …). Walk them in preference order and return the first numeric
+    V3Score; None when no score is present.
+    """
+    cvss = vuln.get("CVSS") or {}
+    if not isinstance(cvss, dict):
+        return None
+    for vendor in ("nvd", "redhat", "ghsa", "oracleoval"):
+        block = cvss.get(vendor) or {}
+        if isinstance(block, dict):
+            for key in ("V3Score", "V2Score"):
+                v = block.get(key)
+                if isinstance(v, (int, float)):
+                    return float(v)
+    return None
+
+
+def parse_trivy(path):
+    """Parse `trivy fs --scanners vuln --format json` output.
+
+    Walks ``.Results[].Vulnerabilities[]`` and emits one finding per CVE.
+    Severity comes from trivy's ``Severity`` field (HIGH/CRITICAL/…) when
+    present, falling back to the CVSS v3 score bands via ``_cvss_to_severity``
+    so advisories that omit the string severity still get a defensible rating.
+
+    The lockfile path (``Target``) becomes the finding ``file`` so the report
+    points the reviewer at the manifest that pins the vulnerable dependency.
+    """
+    findings = []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return [], f"could not parse {path}: {e}"
+    for result in data.get("Results", []) or []:
+        target = result.get("Target", "unknown lockfile")
+        for vuln in result.get("Vulnerabilities", []) or []:
+            cve = vuln.get("VulnerabilityID", "unknown-cve")
+            pkg = vuln.get("PkgName", "?")
+            installed = vuln.get("InstalledVersion", "?")
+            fixed = vuln.get("FixedVersion", "")
+            sev_raw = vuln.get("Severity")
+            if sev_raw:
+                severity = norm_severity(sev_raw)
+            else:
+                severity = _cvss_to_severity(_trivy_cvss_score(vuln))
+            message = f"{pkg} {installed}: {cve}"
+            if fixed:
+                message += f" (fixed in {fixed})"
+            finding = {
+                "tool": "trivy",
+                "rule": cve,
+                "severity": severity,
+                "file": target,
+                "line": "?",
+                "message": message,
+            }
+            findings.append(finding)
+    return findings, None
+
+
+def parse_gitleaks(path):
+    """Parse `gitleaks detect --report-format json` output.
+
+    gitleaks emits a JSON array of findings. The ``Secret`` and ``Match``
+    fields carry the actual credential value — they MUST NOT be copied into
+    the finding ``message``, otherwise the report becomes a secret-on-disk
+    (the exact P0 the redact module exists to prevent). We surface the rule
+    id, file, and line so the reviewer can locate and rotate the credential
+    without the value being persisted.
+    """
+    findings = []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return [], f"could not parse {path}: {e}"
+    if not isinstance(data, list):
+        return [], f"unexpected gitleaks json shape in {path} (expected list)"
+    for r in data:
+        if not isinstance(r, dict):
+            continue
+        rule_id = r.get("RuleID") or r.get("Description") or "unknown-rule"
+        file_path = r.get("File", "unknown file")
+        line = r.get("StartLine", "?")
+        # message intentionally excludes Secret/Match — never persist the value.
+        message = f"Hardcoded secret detected by rule '{rule_id}'"
+        entropy = r.get("Entropy")
+        if entropy is not None:
+            message += f" (entropy={entropy})"
+        findings.append(
+            {
+                "tool": "gitleaks",
+                "rule": rule_id,
+                "severity": "high",
+                "file": file_path,
+                "line": line,
+                "message": message,
+            }
+        )
+    return findings, None
+
+
+def parse_trufflehog(path):
+    """Parse `trufflehog filesystem --json` output (JSONL, one record per line).
+
+    trufflehog streams newline-delimited JSON. The ``Raw`` and ``Redacted``
+    fields carry the credential — like gitleaks, they MUST NOT be copied into
+    the finding message. Verified secrets are escalated to critical (trufflehog
+    has confirmed they're live); unverified ones stay at high.
+
+    Non-JSON lines (progress logs, preamble) are skipped rather than crashing.
+    """
+    findings = []
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except Exception as e:
+        return [], f"could not parse {path}: {e}"
+    for line in lines:
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(r, dict):
+            continue
+        detector = r.get("DetectorName", "unknown-detector")
+        verified = bool(r.get("Verified", False))
+        # path lives under SourceMetadata.Data.Filesystem.path
+        fs_meta = (r.get("SourceMetadata") or {}).get("Data", {}).get("Filesystem", {})
+        file_path = fs_meta.get("path", "unknown file")
+        severity = "critical" if verified else "high"
+        status = "verified" if verified else "unverified"
+        # message intentionally excludes Raw/Redacted — never persist the value.
+        message = f"Secret detected by {detector} detector ({status})"
+        findings.append(
+            {
+                "tool": "trufflehog",
+                "rule": detector,
+                "severity": severity,
+                "file": file_path,
+                "line": "?",
+                "message": message,
+            }
+        )
+    return findings, None
+
+
+def parse_retire(path):
+    """Parse `retire --outputformat json` output (frontend known-CVE library scan).
+
+    retire.js emits a list of components, each carrying one or more
+    vulnerabilities. Each CVE becomes its own finding so the report matches
+    the one-finding-per-CVE shape used by the trivy SCA channel — reviewers
+    can triage and fix CVE-by-CVE rather than a single noisy component entry.
+    """
+    findings = []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return [], f"could not parse {path}: {e}"
+    if not isinstance(data, list):
+        return [], f"unexpected retire json shape in {path} (expected list)"
+    for comp in data:
+        if not isinstance(comp, dict):
+            continue
+        component = comp.get("component", "?")
+        version = comp.get("version", "?")
+        file_path = comp.get("path", "unknown file")
+        for result in comp.get("results", []) or []:
+            for vuln in result.get("vulnerabilities", []) or []:
+                severity = norm_severity(vuln.get("severity", "medium"))
+                identifiers = vuln.get("identifiers") or {}
+                cves = []
+                if isinstance(identifiers, dict):
+                    cves = list(identifiers.get("CVE", []) or [])
+                if not cves:
+                    # No CVE mapped — use retire's internal id so the finding
+                    # still surfaces, rather than dropping it silently.
+                    rule_id = f"retire-{vuln.get('id', 'unknown')}"
+                else:
+                    rule_id = cves[0]
+                message = f"{component} {version}: {rule_id}"
+                findings.append(
+                    {
+                        "tool": "retire",
+                        "rule": rule_id,
+                        "severity": severity,
+                        "file": file_path,
+                        "line": "?",
+                        "message": message,
+                    }
+                )
+    return findings, None
+
+
 # filename (in results dir) -> (parser, tool label)
 PARSERS = {
     "semgrep.sarif": (lambda p: parse_sarif(p, "semgrep"), "semgrep"),
@@ -408,6 +633,14 @@ PARSERS = {
     "security-code-scan.json": (parse_security_code_scan, "security-code-scan"),
     "eslint-security.json": (parse_eslint_security, "eslint-security"),
     "miri.log": (parse_miri_log, "miri"),
+    # SCA + secret channels absorbed from strix's source-aware SAST playbook.
+    # trivy covers all major ecosystems (npm/pypi/go/maven/rubygems/cargo/…)
+    # via lockfile scanning; gitleaks + trufflehog form an independent secret
+    # channel so hardcoded credentials don't depend solely on semgrep p/secrets.
+    "trivy.json": (parse_trivy, "trivy"),
+    "gitleaks.json": (parse_gitleaks, "gitleaks"),
+    "trufflehog.jsonl": (parse_trufflehog, "trufflehog"),
+    "retire.json": (parse_retire, "retire"),
 }
 
 

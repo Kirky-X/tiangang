@@ -16,6 +16,37 @@
     它使用打包好的规则集,在规则包缓存完成后不需要网络调用。
 - 输出:SARIF,位于 `<out>/semgrep.sarif`
 
+## 通用 SCA + 密钥扫描通道
+
+**这三个工具无论检测到哪些语言都运行** —— 依赖 CVE 和硬编码凭证是跨语言问题，把它们的检测独立于语言专属工具之外，避免依赖 Semgrep 的 `p/secrets` 规则集作为唯一通道。吸收自 strix 的 source-aware SAST playbook：单一通道 = 单点失败。
+
+**Trivy** —— 全生态依赖 CVE 扫描（SCA）
+- 检查:`command -v trivy`
+- 安装:`curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin`
+- 扫描:
+  - 先跑 `trivy version --format json > <out>/trivy-version.json`,把 `VulnerabilityDB.UpdatedAt` 写到磁盘 —— 一个 DB 陈旧的 trivy 会返回零结果,而零结果在 DB 过期时是**可疑信号**而非"安全"。把这个信号物化到 results 目录,让报告能显式标注 DB 是否需要刷新。
+  - 再跑 `trivy fs --scanners vuln --offline-scan --format json --output <out>/trivy.json <target>`。`--scanners vuln` 聚焦依赖 CVE(密钥由 gitleaks/trufflehog 通道负责);`--offline-scan` 让 per-package advisory 查询走本地 DB,扫描本身在受限网络下也能跑(DB 刷新单独走 `trivy db update`)。
+- 输出:JSON,位于 `<out>/trivy.json`(扫描结果)+ `<out>/trivy-version.json`(DB 陈旧信号)
+- 捕获:依赖树中所有已公开 CVE 的库版本,覆盖 npm/pip/go/cargo/maven 等主流生态。
+
+**Gitleaks** —— 通用密钥扫描（独立通道）
+- 检查:`command -v gitleaks`
+- 安装:`go install github.com/gitleaks/gitleaks/v8@latest`(需要 `$GOPATH/bin` 在 PATH 上)
+- 扫描:`gitleaks detect --source <target> --report-format json --report-path <out>/gitleaks.json --no-banner`
+- 输出:JSON,位于 `<out>/gitleaks.json`
+- 捕获:AWS/GCP/Slack/Stripe 等带可识别前缀的 token、PEM 私钥块、`password = "..."`/`api_key: '...'` 等带 keyword 前缀的标签式赋值。
+- **退出码语义**:rc=1 表示**发现了密钥**(是 finding 不是 failure)。`run_scan.py` 在输出文件存在时把 rc=1 归一化为 0,避免 manifest 出现误导性的"失败"条目。
+- **secret-on-disk 防护**:gitleaks 的 `Secret`/`Match` 字段携带凭证原文。`generate_report.py` 的 parser 只把 `rule_id` 写入 finding message,**绝不**把 `Secret`/`Match` 放进报告 —— `redact.py` 是 defense in depth,parser 层就先切断泄露路径。
+
+**Trufflehog** —— 通用密钥扫描（验证 + JSONL）
+- 检查:`command -v trufflehog`
+- 安装:`go install github.com/trufflesecurity/trufflehog/v3@latest`(需要 `$GOPATH/bin` 在 PATH 上)
+- 扫描:`trufflehog filesystem --no-update --json --no-verification <target> > <out>/trufflehog.jsonl`
+  - `--no-update` 跳过 detector signature DB 在线更新(离线可跑);`--no-verification` 跳过 live credential 验证 —— 我们要的是"找到候选,排队轮换",而不是让 trufflehog 拿凭证去对真实服务发认证请求(那会把凭证暴露到 access log,且可能触发反爆破锁)。
+- 输出:JSONL,位于 `<out>/trufflehog.jsonl`(每行一个 JSON finding,跳过非 JSON 行)
+- 捕获:gitleaks 规则集之外的额外 detector —— trufflehog 的 detector 库覆盖 700+ 凭证类型,与 gitleaks 的规则式匹配形成互补。
+- **secret-on-disk 防护**:trufflehog 的 `Raw`/`Redacted` 字段同样携带凭证原文。parser 只把 `DetectorName` + `Verified` 标志写入 finding message,`Raw`/`Redacted` 不进报告。
+
 ## Python —— Bandit
 
 - 检测:`requirements.txt`、`pyproject.toml`、`setup.py`、`Pipfile`,或 `.py` 文件占多数
@@ -139,6 +170,33 @@
 - 输出:纯文本日志,位于 `<out>/miri.log`,从中解析 `error: Undefined Behavior` 块
 - 只有项目含有 `unsafe` 块时才值得运行——先用 `grep -r "unsafe" --include=*.rs`
   检查,如果没有则跳过 Miri 并注明原因。
+
+## JavaScript / TypeScript —— njsscan + retire.js + eslint-plugin-security
+
+三个工具覆盖不同维度：njsscan 做模式匹配（rules-as-code），retire.js 做 SCA（已知 CVE 的库版本），eslint-plugin-security 做规则化 lint（与项目 ESLint 配置集成）。
+
+**njsscan**
+- 检查:`command -v njsscan`
+- 安装:`uv tool install njsscan`(独立 Python CLI,无项目侵入)
+- 扫描:`njsscan --sarif <target> > <out>/njsscan.sarif`
+- 输出:SARIF,位于 `<out>/njsscan.sarif`
+- 捕获:Node 调用 `eval`、`child_process.exec` 配字符串拼接、`dangerouslySetInnerHTML`、`serialize-javascript` 等前端/Node 专属模式。
+
+**retire.js** —— JavaScript 依赖 CVE 扫描（SCA）
+- 检查:`command -v retire`
+- 安装:`npm install -g retire`
+- 扫描:`retire --path <target> --outputformat json --outputpath <out>/retire.json`
+- 输出:JSON,位于 `<out>/retire.json`
+- 捕获:已知 CVE 的 JS 库版本（jquery、lodash、angular 等）。与 trivy 的 npm lockfile 扫描互补 —— retire 能发现 `vendor/`、`dist/`、CDN 拷贝等**未在 package-lock.json 中**但实际部署的副本。吸收自 strix 的 source-aware SAST playbook。
+- 一个组件若有多个 CVE,parser 拆成多个 finding（one-finding-per-CVE）,与 trivy 的形态一致,便于按 CVE 在跨工具去重后汇总。
+
+**eslint-plugin-security**
+- 检测:`package.json` 存在,且 eslint 配置文件（`eslint.config.js`/`.eslintrc.*`）中引用了 `eslint-plugin-security` 或 `plugin:security`
+- 安装:`npm install --save-dev eslint eslint-plugin-security`(必须在项目内安装,不能 -g)
+- 扫描:`npx --no-install eslint --format json --output-file <out>/eslint-security.json .`(在项目根目录运行;`--no-install` 避免静默下载)
+- 输出:JSON,位于 `<out>/eslint-security.json`
+- 捕获:`eval`、`child_process.exec` 字符串拼接、`crypto.createCipher`（弱加密）、`Math.random`（用于安全场景）等。
+- 与 FindSecBugs / Security Code Scan 同模式:工具是项目内的 devDependency,挂入项目的 ESLint 配置才能跑。脚本不会静默修改 `package.json` —— 没有接入的项目会跳过并打印操作指引。
 
 ## 检测参考(由 `detect_languages.py` 使用)
 

@@ -64,6 +64,13 @@ def _max_workers():
     return 8
 
 
+# Semgrep per-file timeout and parallelism — explicit values keep runs
+# reproducible across hosts (absorbed from strix's semgrep CLI playbook,
+# which warns that omitting these lets semgrep pick host-dependent defaults).
+SEMGREP_JOBS = 4
+SEMGREP_TIMEOUT = 20  # seconds, per file
+
+
 # B3: reuse SKIP_DIRS from detect_languages to avoid two divergent skip sets
 # (the old _has_ruby_code inline tuple missed __pycache__/venv/.venv/.tox/bin/obj).
 from detect_languages import SKIP_DIRS
@@ -194,13 +201,28 @@ def _has_ruby_code(target):
 
 
 def _run_semgrep(target, out_dir, ran, agent_rules=None):
-    """Run semgrep with offline fallback and optional agent rules."""
+    """Run semgrep with offline fallback and optional agent rules.
+
+    Flags absorbed from strix's semgrep CLI playbook:
+    - ``--metrics=off``: semgrep sends telemetry by default; explicit off is
+      both a privacy requirement and a correctness guard (the metrics call can
+      fail in restricted networks and break the scan).
+    - ``--quiet``: suppress progress noise in automation.
+    - ``--jobs`` / ``--timeout``: explicit values so runs are reproducible
+      across hosts instead of depending on semgrep's host-dependent defaults.
+    """
     sarif = os.path.join(out_dir, "semgrep.sarif")
     semgrep_cmd = [
         "semgrep",
         "scan",
         "--config",
         "auto",
+        "--metrics=off",
+        "--quiet",
+        "--jobs",
+        str(SEMGREP_JOBS),
+        "--timeout",
+        str(SEMGREP_TIMEOUT),
         "--exclude=.security-audit",
         "--sarif",
         "--output",
@@ -229,6 +251,12 @@ def _run_semgrep(target, out_dir, ran, agent_rules=None):
             "p/security-audit",
             "--config",
             "p/secrets",
+            "--metrics=off",
+            "--quiet",
+            "--jobs",
+            str(SEMGREP_JOBS),
+            "--timeout",
+            str(SEMGREP_TIMEOUT),
             "--exclude=.security-audit",
             "--sarif",
             "--output",
@@ -267,6 +295,8 @@ def _run_semgrep(target, out_dir, ran, agent_rules=None):
             "scan",
             "--config",
             agent_rules,
+            "--metrics=off",
+            "--quiet",
             "--exclude=.security-audit",
             "--sarif",
             "--output",
@@ -306,6 +336,158 @@ def _semgrep_thunk(target, out_dir, agent_rules):
     def _run():
         r = []
         _run_semgrep(target, out_dir, r, agent_rules=agent_rules)
+        return r
+
+    return _run
+
+
+def _trivy_thunk(target, out_dir):
+    """trivy SCA thunk: record DB staleness signal, then scan lockfiles.
+
+    The ``trivy version`` JSON is written next to the scan output so a stale
+    ``VulnerabilityDB.UpdatedAt`` shows up as a visible signal rather than
+    letting a clean scan mask an outdated DB. Absorbed from strix's
+    dependency_cve_scanning skill, which warns that "zero results is
+    suspicious" when the DB is stale.
+
+    ``--scanners vuln`` focuses the pass on dependency CVEs (secrets are
+    handled by the gitleaks + trufflehog channel). ``--offline-scan`` keeps
+    per-package advisory lookups offline so the scan works in restricted
+    networks; the DB refresh happens separately via ``trivy db update``.
+    """
+
+    def _run():
+        r = []
+        # DB staleness signal — write version JSON so a stale DB is visible.
+        version_path = os.path.join(out_dir, "trivy-version.json")
+        run_tool(
+            "trivy-version",
+            r,
+            ["trivy", "version", "--format", "json"],
+            output_file=version_path,
+            timeout=120,
+        )
+        # SCA scan: --output writes the JSON report directly (trivy native flag).
+        out_path = os.path.join(out_dir, "trivy.json")
+        run_tool(
+            "trivy",
+            r,
+            [
+                "trivy",
+                "fs",
+                "--scanners",
+                "vuln",
+                "--offline-scan",
+                "--format",
+                "json",
+                "--output",
+                out_path,
+                target,
+            ],
+            timeout=900,
+        )
+        return r
+
+    return _run
+
+
+def _gitleaks_thunk(target, out_dir):
+    """gitleaks secret scanner thunk.
+
+    gitleaks exits 1 when secrets are found — that's a finding, not a failure.
+    The thunk normalizes rc=1 → 0 when the report file was produced, so the
+    manifest doesn't show a misleading "failed" entry for a successful scan
+    that happened to find credentials.
+    """
+
+    def _run():
+        r = []
+        out_path = os.path.join(out_dir, "gitleaks.json")
+        run_tool(
+            "gitleaks",
+            r,
+            [
+                "gitleaks",
+                "detect",
+                "--source",
+                target,
+                "--report-format",
+                "json",
+                "--report-path",
+                out_path,
+                "--no-banner",
+            ],
+            timeout=900,
+        )
+        # rc=1 means "secrets found" — normalize to 0 when the report exists.
+        if r and r[-1]["returncode"] == 1 and os.path.exists(out_path):
+            r[-1]["returncode"] = 0
+            r[-1]["log_tail"] = (
+                (r[-1].get("log_tail") or "")
+                + "\n[gitleaks rc=1 normalized: secrets found, not a failure]"
+            )
+        return r
+
+    return _run
+
+
+def _trufflehog_thunk(target, out_dir):
+    """trufflehog secret scanner thunk (JSONL output to stdout).
+
+    ``--no-update`` skips the detector signature DB update (works offline).
+    ``--no-verification`` skips live credential verification — we want the
+    finding surfaced for rotation without trufflehog making outbound auth
+    attempts against the detected credential's service.
+    """
+
+    def _run():
+        r = []
+        out_path = os.path.join(out_dir, "trufflehog.jsonl")
+        run_tool(
+            "trufflehog",
+            r,
+            [
+                "trufflehog",
+                "filesystem",
+                "--no-update",
+                "--json",
+                "--no-verification",
+                target,
+            ],
+            output_file=out_path,
+            timeout=900,
+        )
+        return r
+
+    return _run
+
+
+def _retire_thunk(target, out_dir):
+    """retire.js thunk — frontend/Node known-CVE library scan.
+
+    Scans for vulnerable versions of JS libraries (jquery, lodash, etc.) that
+    ship in the project. retire writes JSON to --outputpath; exit code is 0
+    even when vulnerabilities are found (unless --exitcode is set), so no
+    normalization is needed.
+    """
+
+    def _run():
+        r = []
+        out_path = os.path.join(out_dir, "retire.json")
+        run_tool(
+            "retire",
+            r,
+            [
+                "retire",
+                "--path",
+                target,
+                "--outputformat",
+                "json",
+                "--outputpath",
+                out_path,
+            ],
+            timeout=600,
+        )
         return r
 
     return _run
@@ -473,6 +655,29 @@ def main():
     else:
         skipped.append(
             {"tool": "semgrep", "reason": "not installed — run install_tools.sh"}
+        )
+
+    # Universal SCA + secret channel (absorbed from strix's source-aware SAST
+    # playbook). trivy covers all major ecosystems via lockfile scanning; the
+    # gitleaks + trufflehog pair forms an independent secret-detection channel
+    # so hardcoded credentials don't depend solely on semgrep's p/secrets.
+    if have("trivy"):
+        tasks.append(("trivy", _trivy_thunk(target, out_dir)))
+    else:
+        skipped.append(
+            {"tool": "trivy", "reason": "not installed — run install_tools.sh"}
+        )
+    if have("gitleaks"):
+        tasks.append(("gitleaks", _gitleaks_thunk(target, out_dir)))
+    else:
+        skipped.append(
+            {"tool": "gitleaks", "reason": "not installed — run install_tools.sh"}
+        )
+    if have("trufflehog"):
+        tasks.append(("trufflehog", _trufflehog_thunk(target, out_dir)))
+    else:
+        skipped.append(
+            {"tool": "trufflehog", "reason": "not installed — run install_tools.sh"}
         )
 
     if "python" in langs:
@@ -689,6 +894,19 @@ def main():
                 {
                     "tool": "eslint-security",
                     "reason": "eslint config not found or eslint-plugin-security not wired — see references/tools.md (npm install --save-dev eslint eslint-plugin-security, then add 'security' to plugins)",
+                }
+            )
+        # retire.js: scans for known-CVE versions of frontend/Node libraries
+        # (jquery, lodash, …) that ship in the project. Complements trivy's
+        # npm lockfile scan by catching vendored/minified copies that aren't
+        # in package-lock.json. Absorbed from strix's source-aware SAST playbook.
+        if have("retire"):
+            tasks.append(("retire", _retire_thunk(target, out_dir)))
+        else:
+            skipped.append(
+                {
+                    "tool": "retire",
+                    "reason": "not installed — run install_tools.sh javascript (npm install -g retire)",
                 }
             )
 

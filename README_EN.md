@@ -20,12 +20,16 @@ The four steps map to four scripts under `scripts/`, each one's output feeding t
   - PHP → **Psalm** (composer integration)
   - .NET → **Security Code Scan** (Roslyn analyzer)
   - Rust → **cargo-audit** + **Miri**
-- **2 universal scanners** — language-agnostic, covering cross-language patterns:
+  - JavaScript/TypeScript → **njsscan** + **retire.js** + **eslint-plugin-security**
+- **Universal SCA + secret scanning channel** — runs on every scan regardless of detected language (absorbed from strix's source-aware SAST playbook):
+  - **Trivy** — full-ecosystem dependency CVE scan (npm/pip/go/cargo/maven); DB staleness signal materialized to `trivy-version.json`, so a zero-result scan no longer masquerades as "secure" when the DB is stale
+  - **Gitleaks** + **Trufflehog** — independent dual-channel secret scanning, decoupled from Semgrep's `p/secrets` ruleset (single channel = single point of failure); parsers strip `Secret`/`Match`/`Raw`/`Redacted` from finding messages so credentials never land on disk in the report
+- **2 universal SAST scanners** — language-agnostic, covering cross-language patterns:
   - **Semgrep** — always runs; catches hardcoded secrets, unsafe deserialization, etc.
   - **CodeQL** — optional deep pass; needs a compiled query database, see `references/codeql.md`
 - **4-step workflow** — Detect → Install → Scan → Report, each step's output feeds the next
 - **Multi-language project support** — auto-discovers all languages (e.g. Python backend + Go sidecar) and scans all of them, not just the dominant one
-- **Unified report** — heterogeneous outputs from up to five tools (SARIF/JSON/XML) merged into one Markdown report grouped by severity
+- **Unified report** — heterogeneous outputs from many tools (SARIF/JSON/XML/JSONL) merged into one Markdown report grouped by severity
 - **Fail loud** — missing tools, install failures, and skipped scans are explicitly noted with reasons in the report, not silently "successful"
 - **Clean scan ≠ secure** — the report explicitly distinguishes "what was actually checked" from "guarantee of no vulnerabilities" to avoid misleading users
 
@@ -143,8 +147,8 @@ flowchart TD
 
 1. `detect_languages` returns every language above the noise threshold using manifest files (`requirements.txt`, `go.mod`, `Cargo.toml`, etc. — a strong signal) plus extension counts (a weaker signal, filtered by a minimum file count so a single stray script doesn't pull in an irrelevant tool)
 2. `install_tools` checks each relevant tool and installs only what's missing; for tools that can't be auto-installed (FindSecBugs / Security Code Scan / Psalm) it prints what to do rather than silently skipping
-3. `run_scan` always runs Semgrep (language-agnostic, catches cross-language patterns like hardcoded secrets) plus the language-specific tools available from step 2; writes each tool's raw output and a `scan_manifest.json` recording what ran and what was skipped
-4. `generate_report` parses heterogeneous formats (SARIF / Bandit JSON / Cppcheck XML / cargo-audit JSON — extend `PARSERS` in the script if you wire in a new tool) into one Markdown: a summary table by severity, a list of any tools that didn't run and why, and findings grouped by severity then by file
+3. `run_scan` always runs Semgrep (language-agnostic, catches cross-language patterns like hardcoded secrets) + the universal SCA/secret channel (trivy/gitleaks/trufflehog, runs regardless of detected language) + the language-specific tools available from step 2; writes each tool's raw output and a `scan_manifest.json` recording what ran and what was skipped
+4. `generate_report` parses heterogeneous formats (SARIF / Bandit JSON / Cppcheck XML / cargo-audit JSON / Trivy JSON / Gitleaks JSON / Trufflehog JSONL / Retire JSON — extend `PARSERS` in the script if you wire in a new tool) into one Markdown: a summary table by severity, a list of any tools that didn't run and why, and findings grouped by severity then by file. Secret-channel parsers keep only rule id / detector name in finding messages — credential values (`Secret`/`Match`/`Raw`/`Redacted`) never enter the report; `redact.py` is defense in depth
 
 ## FAQ
 
