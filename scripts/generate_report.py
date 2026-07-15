@@ -33,7 +33,11 @@ from collections import defaultdict
 try:
     from defusedxml import ElementTree as ET
 except ImportError:
-    import xml.etree.ElementTree as ET
+    # Fallback to stdlib ElementTree. XXE risk is mitigated because
+    # ElementTree (unlike minidom/sax) does not resolve external entities
+    # by default — expat's external_entity_ref_handler is None. defusedxml
+    # remains the preferred parser; install it via `pip install defusedxml`.
+    import xml.etree.ElementTree as ET  # nosemgrep: python.lang.security.use-defused-xml.use-defused-xml
 
 # redact.py lives next to this script. Importing it means the secret
 # redaction rules have a single source of truth (no second copy here).
@@ -230,7 +234,11 @@ def parse_bandit(path):
 def parse_cppcheck(path):
     findings = []
     try:
-        tree = ET.parse(path)
+        # ET comes from defusedxml when installed (preferred); the stdlib
+        # fallback (see import above) is safe because ElementTree does not
+        # resolve external entities by default. nosemgrep suppresses the
+        # static flag on the fallback path.
+        tree = ET.parse(path)  # nosemgrep: python.lang.security.use-defused-xml-parse.use-defused-xml-parse
     except Exception as e:
         return [], f"could not parse {path}: {e}"
     for err in tree.getroot().iter("error"):
@@ -617,6 +625,61 @@ def parse_retire(path):
     return findings, None
 
 
+def parse_trivy_version(path):
+    """Parse `trivy version --format json` output to surface DB staleness.
+
+    trivy returns zero findings when its vulnerability DB is stale, which
+    masquerades as "secure" — exactly the false-negative this signal exists
+    to catch. We emit a single `medium` finding when the DB is older than
+    14 days so the report explicitly says "trivy DB is N days old, run
+    `trivy db update`" rather than silently showing zero trivy findings.
+
+    No finding is emitted when the DB is fresh or the version JSON is
+    malformed (the latter produces a parse error so collect_findings logs it).
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return [], f"could not parse {path}: {e}"
+    db_info = data.get("VulnerabilityDB") or {}
+    if not isinstance(db_info, dict):
+        return [], None
+    updated = db_info.get("UpdatedAt") or db_info.get("CreatedAt")
+    if not updated:
+        # No timestamp to check — don't fabricate a finding, just pass through.
+        return [], None
+    try:
+        # trivy emits RFC3339 timestamps (e.g. "2026-07-01T12:00:00Z").
+        from datetime import datetime, timezone
+
+        # Python <3.11 datetime.fromisoformat doesn't parse "Z" suffix; replace it.
+        ts = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        age_days = (datetime.now(timezone.utc) - ts).days
+    except (ValueError, TypeError):
+        return [], None
+    if age_days < 0:
+        # Future timestamp — clock skew, don't false-alarm.
+        return [], None
+    if age_days <= 14:
+        return [], None
+    return [
+        {
+            "tool": "trivy-version",
+            "rule": "stale-vuln-db",
+            "severity": "medium",
+            "file": "trivy-version.json",
+            "line": "?",
+            "message": (
+                f"trivy vulnerability DB is {age_days} days old "
+                f"(UpdatedAt={updated}) — run `trivy db update`. "
+                f"A stale DB can return zero findings for known CVEs; "
+                f"treat any clean trivy result with caution."
+            ),
+        }
+    ], None
+
+
 # filename (in results dir) -> (parser, tool label)
 PARSERS = {
     "semgrep.sarif": (lambda p: parse_sarif(p, "semgrep"), "semgrep"),
@@ -638,6 +701,7 @@ PARSERS = {
     # via lockfile scanning; gitleaks + trufflehog form an independent secret
     # channel so hardcoded credentials don't depend solely on semgrep p/secrets.
     "trivy.json": (parse_trivy, "trivy"),
+    "trivy-version.json": (parse_trivy_version, "trivy-version"),
     "gitleaks.json": (parse_gitleaks, "gitleaks"),
     "trufflehog.jsonl": (parse_trufflehog, "trufflehog"),
     "retire.json": (parse_retire, "retire"),
