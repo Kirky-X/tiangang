@@ -1,9 +1,11 @@
 .claude
+.claude-plugin/
 .venv
 openspec/
 specmark/
 temp
 .gitnexus
+.analysis/
 
 # OS
 .DS_Store
