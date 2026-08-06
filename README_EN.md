@@ -1,6 +1,6 @@
 # Tiangang (天罡) — SAST Static Application Security Testing Suite
 
-[中文](README.md)
+[中文](README.md) | English
 
 [![GitHub Release](https://img.shields.io/github/v/release/Kirky-X/tiangang?style=flat-square)](https://github.com/Kirky-X/tiangang/releases) [![GitHub License](https://img.shields.io/github/license/Kirky-X/tiangang?style=flat-square)](LICENSE)
 
@@ -31,6 +31,14 @@ The four steps map to four scripts under `scripts/`, each one's output feeding t
 - **4-step workflow** — Detect → Install → Scan → Report, each step's output feeds the next
 - **Multi-language project support** — auto-discovers all languages (e.g. Python backend + Go sidecar) and scans all of them, not just the dominant one
 - **Unified report** — heterogeneous outputs from many tools (SARIF/JSON/XML/JSONL) merged into one Markdown report grouped by severity
+- **CI/CD native integration** — `--ci` mode outputs GitHub Actions annotations, `--gate` threshold controls blocking severity
+- **Incremental scanning** — `--diff-only` scans only git-changed files, file hash cache avoids redundant scans
+- **Multi-format report output** — `--format md|html|json|all` supports Markdown, HTML, and JSON report formats
+- **Cross-tool finding correlation** — three-tier dedup (exact + CWE same-location + proximity) + multi-tool confirmation tags
+- **Enhanced secret detection** — new patterns for Alibaba Cloud/Tencent Cloud/OpenAI/DB connection strings + Shannon entropy fallback
+- **LLM false positive filtering** — `--triage` generates LLM classification prompt for triage assessment
+- **Scan trend tracking** — `--trend` shows comparison with historical scans, revealing trends
+- **Plugin architecture** — `ToolPlugin` base class for extending with new scanners without modifying core dispatch
 - **Fail loud** — missing tools, install failures, and skipped scans are explicitly noted with reasons in the report, not silently "successful"
 - **Clean scan ≠ secure** — the report explicitly distinguishes "what was actually checked" from "guarantee of no vulnerabilities" to avoid misleading users
 
@@ -94,9 +102,17 @@ bash scripts/install_tools.sh all
 
 # 3. Run the scan (Semgrep always on + per-language tools)
 python3 scripts/run_scan.py <target-dir> [--out <results-dir>] [--langs python,go,...]
+# CI mode: exit code reflects finding severity, outputs GitHub Actions annotations
+python3 scripts/run_scan.py <target-dir> --ci --gate high
+# Incremental mode: only scan files changed since a git ref
+python3 scripts/run_scan.py <target-dir> --diff-only --since HEAD~1
 
-# 4. Generate the unified Markdown report
-python3 scripts/generate_report.py <results-dir> [--out report.md]
+# 4. Generate the unified report (multiple formats supported)
+python3 scripts/generate_report.py <results-dir> [--out report.md] [--format md|html|json|all]
+# Include trend comparison with previous scans
+python3 scripts/generate_report.py <results-dir> --trend
+# Generate LLM triage prompt for false positive assessment
+python3 scripts/generate_report.py <results-dir> --triage
 ```
 
 ### Typical scenarios

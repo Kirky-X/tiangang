@@ -1,6 +1,6 @@
 # Tiangang (天罡) —— SAST 静态应用安全测试套件
 
-[English](README_EN.md)
+中文 | [English](README_EN.md)
 
 [![GitHub Release](https://img.shields.io/github/v/release/Kirky-X/tiangang?style=flat-square)](https://github.com/Kirky-X/tiangang/releases) [![GitHub License](https://img.shields.io/github/license/Kirky-X/tiangang?style=flat-square)](LICENSE)
 
@@ -12,16 +12,17 @@ Tiangang 是一个面向 AI agent 的 SAST(static application security testing)s
 
 ## 功能特性
 
-- **10 种语言专属扫描器** —— 每种语言都有目的构建的工具,而非通用规则套用:
+- **10 种语言专属扫描器** —— 每种语言都有目的构建的工具，而非通用规则套用:
   - Python → **Bandit**
-  - Java → **FindSecBugs**(Maven/Gradle 集成)
+  - Java → **FindSecBugs**（Maven/Gradle 集成）
   - Go → **Gosec**
   - C/C++ → **Flawfinder** + **Cppcheck**
-  - Ruby → **Brakeman**(Rails 专用)
-  - PHP → **Psalm**(composer 集成)
-  - .NET → **Security Code Scan**(Roslyn 分析器)
+  - Ruby → **Brakeman**（Rails 专用）
+  - PHP → **Psalm**（composer 集成）
+  - .NET → **Security Code Scan**（Roslyn 分析器）
   - Rust → **cargo-audit** + **Miri**
   - JavaScript/TypeScript → **njsscan** + **retire.js** + **eslint-plugin-security**
+  - IaC（基础设施即代码）→ **checkov** + **tfsec**（Terraform/K8s/Docker/CloudFormation）
 - **通用 SCA + 密钥扫描通道** —— 无论检测到哪些语言都运行(吸收自 strix source-aware SAST playbook):
   - **Trivy** —— 全生态依赖 CVE 扫描,覆盖 npm/pip/go/cargo/maven 等主流生态;DB 陈旧信号物化到 `trivy-version.json`,零结果不再误导为"安全"
   - **Gitleaks** + **Trufflehog** —— 独立密钥扫描双通道,与 Semgrep `p/secrets` 规则集解耦(单一通道 = 单点失败);parser 层切断 secret-on-disk 路径,`Secret`/`Match`/`Raw`/`Redacted` 原文绝不进报告
@@ -31,7 +32,15 @@ Tiangang 是一个面向 AI agent 的 SAST(static application security testing)s
 - **4 步工作流** —— 检测 → 安装 → 扫描 → 报告,各步骤输出作为下一步输入
 - **多语言项目支持** —— 自动发现所有语言(如 Python 后端 + Go sidecar),全部扫描而非只扫主导语言
 - **统一报告** —— 多种工具的异构输出格式(SARIF/JSON/XML/JSONL)归并为一份按严重级别分组的 Markdown 报告
-- **失败显性化** —— 工具缺失、安装失败、扫描被跳过都会在报告中明确标注原因,而非静默"成功"
+- **CI/CD 原生集成** —— `--ci` 模式输出 GitHub Actions annotations,`--gate` 门禁阈值控制阻断级别
+- **增量扫描** —— `--diff-only` 只扫描 git 变更文件,文件哈希缓存避免重复扫描
+- **多格式报告输出** —— `--format md|html|json|all` 支持 Markdown/HTML/JSON 三种报告格式
+- **跨工具 Finding 关联** —— 三层去重(精确匹配 + CWE 同位置 + 邻近行) + 多工具确认标记
+- **Secret 检测增强** —— 支持阿里云/腾讯云/OpenAI/数据库连接串等新增模式 + Shannon 熵值兜底检测
+- **LLM 误报过滤** —— `--triage` 生成 LLM 分类提示词,用于 false positive 评估
+- **扫描趋势追踪** —— `--trend` 显示与历史扫描的对比,发现增减趋势
+- **插件化架构** —— `ToolPlugin` 基类支持扩展新扫描器而无需修改核心调度逻辑
+- **失败显性化** —— 工具缺失、安装失败、扫描被跳过都会在报告中明确标注原因,而非静默“成功”
 - **清洁扫描不等于安全** —— 报告中明确区分"实际检查范围"与"无漏洞保证",避免误导
 
 ## 安装
@@ -94,9 +103,17 @@ bash scripts/install_tools.sh all
 
 # 3. 运行扫描(Semgrep 始终运行 + 各语言专属工具)
 python3 scripts/run_scan.py <target-dir> [--out <results-dir>] [--langs python,go,...]
+# CI 模式:退出码反映 finding 严重级别,输出 GitHub Actions annotations
+python3 scripts/run_scan.py <target-dir> --ci --gate high
+# 增量模式:只扫描自上次提交以来变更的文件
+python3 scripts/run_scan.py <target-dir> --diff-only --since HEAD~1
 
-# 4. 生成统一 Markdown 报告
-python3 scripts/generate_report.py <results-dir> [--out report.md]
+# 4. 生成统一报告(支持多种格式)
+python3 scripts/generate_report.py <results-dir> [--out report.md] [--format md|html|json|all]
+# 包含趋势对比
+python3 scripts/generate_report.py <results-dir> --trend
+# 生成 LLM 误报过滤提示词
+python3 scripts/generate_report.py <results-dir> --triage
 ```
 
 ### 典型场景

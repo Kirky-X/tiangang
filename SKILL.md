@@ -1,6 +1,6 @@
 ---
 name: tiangang
-description: "专业 SAST 安全审查工具集，运行 Semgrep/CodeQL/各语言专属扫描器产出统一报告。触发词：安全审查/漏洞扫描/SAST/代码安全检查/hardcoded secrets/SQL injection/unsafe eval/buffer overflow/insecure deserialization/发布前安全检查。"
+description: "专业 SAST 安全审查工具集，运行 Semgrep/CodeQL/各语言专属扫描器产出统一报告，可选叠加 AI 代码审查（OCR）。触发词：安全审查/漏洞扫描/SAST/代码安全检查/hardcoded secrets/SQL injection/unsafe eval/buffer overflow/insecure deserialization/发布前安全检查/AI代码审查。"
 license: MIT
 ---
 
@@ -22,6 +22,8 @@ license: MIT
 - **.NET**：Security Code Scan
 - **Rust**：cargo-audit / Miri
 - **JavaScript/TypeScript**：njsscan / retire.js / eslint-plugin-security
+- **IaC（基础设施即代码）**：checkov / tfsec（Terraform/Kubernetes/Docker/CloudFormation）
+- **AI 代码审查**（opt-in）：open-code-review / OCR（LLM 驱动，捕获逻辑 bug、性能问题、可维护性 concern——与 SAST 互补）
 
 整体流程：自动检测目标目录中的语言，指导安装缺失的工具，运行扫描并生成报告——不要让用户自己先说出工具名。
 
@@ -59,6 +61,10 @@ bash scripts/install_tools.sh <lang1> <lang2> ...     # or: bash scripts/install
 
 ```bash
 python3 scripts/run_scan.py <target-dir> [--out <results-dir>] [--langs python,go,...]
+# CI 模式: 退出码反映 finding 严重级别, 输出 GitHub Actions annotations
+python3 scripts/run_scan.py <target-dir> --ci --gate high
+# 增量模式: 只扫描 git 变更文件
+python3 scripts/run_scan.py <target-dir> --diff-only --since HEAD~1
 ```
 
 运行 Semgrep（始终运行——语言无关，能捕获 hardcoded secrets 等各语言专属工具不查的问题）加上通用 SCA/密钥扫描通道（trivy/gitleaks/trufflehog，无论检测到哪些语言都运行）和第 2 步中可用的语言专属工具。把每个工具的原始输出（SARIF 或 JSON，见 `references/tools.md`）写入 results 目录，同时写入 `scan_manifest.json` 记录哪些运行了、哪些被跳过。被跳过的工具不会让运行失败——带着"这里有什么没覆盖"的清晰说明的局部扫描，比拒绝产出任何东西更有用。
@@ -74,12 +80,48 @@ python3 scripts/run_scan.py <target-dir> [--out <results-dir>] [--langs python,g
 ### 4. 生成报告
 
 ```bash
-python3 scripts/generate_report.py <results-dir> [--out report.md]
+python3 scripts/generate_report.py <results-dir> [--out report.md] [--format md|html|json|all]
+# 包含趋势对比
+python3 scripts/generate_report.py <results-dir> --trend
+# 生成 LLM 误报过滤提示词
+python3 scripts/generate_report.py <results-dir> --triage
 ```
 
 解析 results 目录中的每个原始工具输出（SARIF、Bandit JSON、Cppcheck XML、cargo-audit JSON、Trivy/Gitleaks/Trufflehog/Retire JSON/JSONL——如果接入新工具，扩展脚本中的 `PARSERS`），汇总成一份 Markdown 报告：按严重程度的汇总表、未运行工具的列表及原因、按严重程度再按文件分组的发现。把这份文件作为交付物呈现给用户——不要把原始工具输出粘到对话里，这一步的全部意义就是把五种工具各自奇奇怪怪的格式变成人类能读的一份东西。
 
 **密钥扫描输出的 secret-on-disk 防护**:gitleaks 的 `Secret`/`Match`、trufflehog 的 `Raw`/`Redacted` 字段携带凭证原文。`generate_report.py` 的 parser 在 message 中只保留 rule id / detector name / verified 标志,**绝不**把凭证原文写入报告 —— `redact.py` 的通用正则脱敏是 defense in depth,parser 层是第一道防线。这是一个 P0 安全要求:安全工具自身的输出不能成为 secret-on-disk 的载体。
+
+## AI 代码审查（opt-in）
+
+在确定性 SAST 扫描之上，可选叠加 AI 驱动的代码审查层。OCR（open-code-review）读取 Git diff 或全文件，通过 LLM 分析生成结构化、行级精度的审查意见——捕获逻辑 bug、性能问题、可维护性 concern 等 SAST 模式匹配不触及的问题。
+
+```bash
+# 全文件审计（不需要 git，审查整个目录）
+python3 scripts/run_scan.py <target-dir> --ocr
+# Git diff 审查（需要 git 仓库，审查 staged + unstaged 变更）
+python3 scripts/run_scan.py <target-dir> --ocr-delegate
+```
+
+**两种模式**：
+- `--ocr`：`ocr scan` 模式，审计整个目录的全文件，不需要 git 历史。适合审计不熟悉的代码库。
+- `--ocr-delegate`：`ocr review` 模式，审查 git diff（staged + unstaged + untracked 变更）。适合 PR/commit 审查。
+
+**前提条件**：
+- `ocr` CLI 已安装（`npm install -g @alibaba-group/open-code-review`，或运行 `install_tools.sh`）
+- scan/review 模式需配置 LLM（`ocr config provider` + `ocr config model`）
+- delegate 模式无需 OCR 侧 LLM 配置——让宿主 agent 用自己的智能做审查
+
+**不默认运行**：OCR 需要外部 LLM API，引入延迟和成本。只在用户显式请求时启用。默认扫描流程不受影响。
+
+**委托工作流**（交互式，不需要自动化管道）：
+```bash
+# 1. 预览哪些文件会被审查
+ocr delegate preview --from main --to feature-branch
+# 2. 获取审查规则（按文件分组）
+ocr delegate rule <path1> <path2> ...
+# 3. 获取 diff 并审查
+git diff <merge-base>..<to> -- <path>
+```
 
 ## 报告之后
 
