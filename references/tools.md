@@ -198,17 +198,63 @@
 - 捕获:`eval`、`child_process.exec` 字符串拼接、`crypto.createCipher`（弱加密）、`Math.random`（用于安全场景）等。
 - 与 FindSecBugs / Security Code Scan 同模式:工具是项目内的 devDependency,挂入项目的 ESLint 配置才能跑。脚本不会静默修改 `package.json` —— 没有接入的项目会跳过并打印操作指引。
 
-## 检测参考(由 `detect_languages.py` 使用)
+## IaC —— checkov + tfsec
+
+两个工具覆盖不同维度：checkov 做广覆盖（Terraform/Kubernetes/Docker/CloudFormation/ARM），tfsec 做 Terraform 深度分析（provider 专属安全规则）。
+
+**checkov**
+- 检查：`command -v checkov`
+- 安装：`uv tool install checkov`
+- 扫描：`checkov --directory <target> --output json --quiet --compact > <out>/checkov.json`
+- 输出：JSON，位于 `<out>/checkov.json`
+- 捕获：Terraform 不安全默认配置、K8s 缺失安全上下文、Docker 最佳实践违规、CloudFormation 资源 misconfiguration、密码策略缺失等。
+- **退出码语义**：rc=1 表示发现了 finding（不是 failure）。`run_scan.py` 在输出文件存在时把 rc=1 归一化为 0。
+
+**tfsec**
+- 检查：`command -v tfsec`
+- 安装：`go install github.com/aquasecurity/tfsec/cmd/tfsec@latest`
+- 扫描：`tfsec <target> --format json --out <out>/tfsec.json --soft-fail`
+- 输出：JSON，位于 `<out>/tfsec.json`
+- 捕获：Terraform 专属安全规则——AWS S3 桶公开访问、Azure NSG 规则过宽、GCP IAM 权限过大、硬编码凭证等。
+
+## AI 代码审查 —— open-code-review (OCR)
+
+AI 驱动的代码审查工具，读取 Git diff 并生成结构化、行级精度的审查意见。与确定性 SAST 工具互补——捕获逻辑 bug、性能问题、可维护性 concern 等 SAST 不覆盖的维度。通过 `--ocr` 或 `--ocr-delegate` opt-in 启用，不默认运行。
+
+- 检查：`command -v ocr`
+- 安装：`npm install -g @alibaba-group/open-code-review`
+- LLM 配置：`ocr config provider` 然后 `ocr config model`（scan/review 模式需要；delegate 模式不需要）
+- 扫描（全文件审计，不需要 git）：
+  - `ocr scan --format json --output <out>/ocr.json <target>`
+- 审查（Git diff 模式，需要 git 仓库）：
+  - `ocr review --format json --audience agent > <out>/ocr.json`（在 target 目录下运行）
+- 委托模式（无需 LLM API，让宿主 agent 做审查）：
+  - `ocr delegate preview` → 确定审查文件列表
+  - `ocr delegate rule <paths>` → 获取审查规则
+  - 详见 SKILL.md 的 OCR 委托工作流说明
+- 输出：JSON，位于 `<out>/ocr.json`
+- 捕获：逻辑 bug、安全漏洞、性能问题、可维护性 concern、风格问题——LLM 驱动的动态分析，覆盖 SAST 模式匹配不触及的跨文件上下文问题。
+- **退出码语义**：rc=1 表示发现了 finding（不是 failure）。`run_scan.py` 在输出文件存在时把 rc=1 归一化为 0。
+- **secret-on-disk 防护**：OCR 的 `content` 字段可能包含代码片段。`generate_report.py` 的 parser 层 + `redact.py` 的通用脱敏确保凭证不进报告。
+- **自定义规则**：支持项目级 `.opencodereview/rule.json`，通过路径匹配 + 自然语言规则补充内置审查规则。
+
+## 检测参考（由 `detect_languages.py` 使用）
 
 | 语言 | 强信号(manifest 文件) | 弱信号(扩展名占多数) |
 |---|---|---|
 | Python | `requirements.txt`、`pyproject.toml`、`setup.py`、`Pipfile` | `.py` |
 | Java | `pom.xml`、`build.gradle`、`build.gradle.kts` | `.java` |
 | Go | `go.mod` | `.go` |
-| C/C++ | `CMakeLists.txt`、`Makefile` + 存在 `.c`/`.h`/`.cpp`/`.hpp` | `.c`、`.h`、`.cpp`、`.hpp`、`.cc` |
+| C/C++ | `CMakeLists.txt`、`Makefile`、`configure.ac`、`meson.build` | `.c`、`.h`、`.cpp`、`.hpp`、`.cc` |
 | Ruby | `Gemfile` | `.rb` |
 | PHP | `composer.json` | `.php` |
 | .NET | `.csproj`、`.sln` | `.cs` |
 | Rust | `Cargo.toml` | `.rs` |
+| IaC | `main.tf`、`terraform.tf`、`Chart.yaml`、`Dockerfile`、`docker-compose.yml` | `.tf`、`.hcl` |
+| Kotlin | — | `.kt`、`.kts` |
+| Swift | — | `.swift` |
+| Scala | — | `.scala` |
+| Dart | — | `.dart` |
+| Elixir | — | `.ex`、`.exs` |
 
 一个项目可能(且经常)包含不止一种语言——例如 Python 后端配一个小的 Go 服务。把所有高于噪声阈值检测到的语言全部扫描,不要只扫主导语言。
