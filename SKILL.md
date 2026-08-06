@@ -23,7 +23,7 @@ license: MIT
 - **Rust**：cargo-audit / Miri
 - **JavaScript/TypeScript**：njsscan / retire.js / eslint-plugin-security
 - **IaC（基础设施即代码）**：checkov / tfsec（Terraform/Kubernetes/Docker/CloudFormation）
-- **AI 代码审查**（opt-in）：open-code-review / OCR（LLM 驱动，捕获逻辑 bug、性能问题、可维护性 concern——与 SAST 互补）
+- **AI 代码审查**（单独触发，`--ocr` / `--ocr-delegate`）：open-code-review / OCR（LLM 驱动，扫描完成后独立运行，捕获逻辑 bug、性能问题、可维护性 concern——与 SAST 互补）
 
 整体流程：自动检测目标目录中的语言，指导安装缺失的工具，运行扫描并生成报告——不要让用户自己先说出工具名。
 
@@ -91,27 +91,35 @@ python3 scripts/generate_report.py <results-dir> --triage
 
 **密钥扫描输出的 secret-on-disk 防护**:gitleaks 的 `Secret`/`Match`、trufflehog 的 `Raw`/`Redacted` 字段携带凭证原文。`generate_report.py` 的 parser 在 message 中只保留 rule id / detector name / verified 标志,**绝不**把凭证原文写入报告 —— `redact.py` 的通用正则脱敏是 defense in depth,parser 层是第一道防线。这是一个 P0 安全要求:安全工具自身的输出不能成为 secret-on-disk 的载体。
 
-## AI 代码审查（opt-in）
+## AI 代码审查（单独触发）
 
-在确定性 SAST 扫描之上，可选叠加 AI 驱动的代码审查层。OCR（open-code-review）读取 Git diff 或全文件，通过 LLM 分析生成结构化、行级精度的审查意见——捕获逻辑 bug、性能问题、可维护性 concern 等 SAST 模式匹配不触及的问题。
+在确定性 SAST 扫描**完成后**，可单独触发 AI 驱动的代码审查层。OCR（open-code-review）读取 Git diff 或全文件，通过 LLM 分析生成结构化、行级精度的审查意见——捕获逻辑 bug、性能问题、可维护性 concern 等 SAST 模式匹配不触及的问题。
+
+**OCR 不会自动触发**——只在用户显式请求时作为独立后续步骤运行。正常安全扫描始终先完成，OCR 在其后单独执行。
 
 ```bash
-# 全文件审计（不需要 git，审查整个目录）
+# 1. 先运行正常安全扫描（不含 OCR）
+python3 scripts/run_scan.py <target-dir>
+# 2. 单独触发 AI 代码审查
 python3 scripts/run_scan.py <target-dir> --ocr
-# Git diff 审查（需要 git 仓库，审查 staged + unstaged 变更）
+# 或 Git diff 审查
 python3 scripts/run_scan.py <target-dir> --ocr-delegate
 ```
 
 **两种模式**：
-- `--ocr`：`ocr scan` 模式，审计整个目录的全文件，不需要 git 历史。适合审计不熟悉的代码库。
+- `--ocr`：`ocr scan` 模式，审计整个目录的全文件，不需要 git 历史。适合审计不熟悉的代码库。支持按子目录分批扫描 + 失败重试。
 - `--ocr-delegate`：`ocr review` 模式，审查 git diff（staged + unstaged + untracked 变更）。适合 PR/commit 审查。
+
+**可选参数**：
+- `--ocr-background TEXT`：追加审查背景（与自动检测的项目类型背景合并）
+- `--ocr-delay N`：批次间延迟秒数（默认 5，防止速率限制）
+- `--ocr-retry N`：失败重试轮次（默认 2）
+- `--ocr-timeout N`：单文件超时分钟数（默认 60）
 
 **前提条件**：
 - `ocr` CLI 已安装（`npm install -g @alibaba-group/open-code-review`，或运行 `install_tools.sh`）
-- scan/review 模式需配置 LLM（`ocr config provider` + `ocr config model`）
-- delegate 模式无需 OCR 侧 LLM 配置——让宿主 agent 用自己的智能做审查
-
-**不默认运行**：OCR 需要外部 LLM API，引入延迟和成本。只在用户显式请求时启用。默认扫描流程不受影响。
+- 配置 LLM API 密钥（`export AGNES_TOKEN=<key>` 或 `export OCR_LLM_TOKEN=<key>`）
+- 可选配置：`OCR_LLM_URL`、`OCR_LLM_MODEL`、`OCR_LLM_PROTOCOL`
 
 **委托工作流**（交互式，不需要自动化管道）：
 ```bash
