@@ -29,6 +29,7 @@ import os
 import re
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 
 try:
     from defusedxml import ElementTree as ET
@@ -651,8 +652,6 @@ def parse_trivy_version(path):
         return [], None
     try:
         # trivy emits RFC3339 timestamps (e.g. "2026-07-01T12:00:00Z").
-        from datetime import datetime, timezone
-
         # Python <3.11 datetime.fromisoformat doesn't parse "Z" suffix; replace it.
         ts = datetime.fromisoformat(updated.replace("Z", "+00:00"))
         age_days = (datetime.now(timezone.utc) - ts).days
@@ -680,6 +679,120 @@ def parse_trivy_version(path):
     ], None
 
 
+def parse_checkov(path):
+    """Parse checkov JSON output (IaC security scanner).
+
+    checkov emits a JSON object with a "results" key containing
+    "passed_checks" and "failed_checks" lists. We only report failed checks
+    — passed checks are noise in a security report.
+    """
+    findings = []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return [], f"could not parse {path}: {e}"
+    results = data.get("results") or {}
+    if not isinstance(results, dict):
+        return [], None
+    for check in results.get("failed_checks", []) or []:
+        if not isinstance(check, dict):
+            continue
+        check_id = check.get("check_id", "unknown-check")
+        resource = check.get("resource", "unknown-resource")
+        file_path = check.get("file_path", "unknown file")
+        file_path = file_path.lstrip("/") if file_path else "unknown file"
+        line_range = check.get("file_line_range")
+        line_no = line_range[0] if isinstance(line_range, list) and line_range else "?"
+        severity = norm_severity(check.get("severity"))
+        guideline = check.get("guideline", "")
+        message = f"{check_id}: {check.get('name', '')} (resource: {resource})"
+        if guideline:
+            message += f" — see {guideline}"
+        findings.append({
+            "tool": "checkov", "rule": check_id, "severity": severity,
+            "file": file_path, "line": line_no, "message": message,
+        })
+    return findings, None
+
+
+def parse_tfsec(path):
+    """Parse tfsec JSON output (Terraform-specific security scanner)."""
+    findings = []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return [], f"could not parse {path}: {e}"
+    results = data.get("results") if isinstance(data, dict) else data
+    if not isinstance(results, list):
+        return [], None
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        rule_id = r.get("rule_id") or r.get("ruleID") or "unknown-rule"
+        severity = norm_severity(r.get("severity"))
+        location = r.get("location", {}) or {}
+        file_path = location.get("filename", "unknown file")
+        line = location.get("start_line", "?")
+        message = r.get("description", "") or r.get("rule_description", "")
+        if r.get("resolution"):
+            message += f" — fix: {r['resolution']}"
+        findings.append({
+            "tool": "tfsec", "rule": rule_id, "severity": severity,
+            "file": file_path, "line": line, "message": message,
+        })
+    return findings, None
+
+
+def parse_ocr(path):
+    """Parse OCR (open-code-review) JSON output (AI-powered code review).
+
+    OCR emits a JSON array of review comments, each with:
+      - path: file path
+      - content: review comment text
+      - start_line / end_line: line range
+      - category: bug|security|performance|maintainability|test|style|documentation|other
+      - severity: critical|high|medium|low
+      - suggestion_code: optional fix suggestion
+
+    The ``content`` field is mapped to finding ``message``; ``suggestion_code``
+    to ``fix``. Category is encoded in the ``rule`` field as ``ocr/<category>``
+    so it's visible in the report alongside the tool name. ``content`` is run
+    through ``redact_secrets`` via the standard post-processing pipeline — OCR
+    may include code snippets that contain hardcoded credentials.
+    """
+    findings = []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return [], f"could not parse {path}: {e}"
+    if not isinstance(data, list):
+        return [], f"unexpected ocr json shape in {path} (expected list)"
+    for r in data:
+        if not isinstance(r, dict):
+            continue
+        category = r.get("category", "other")
+        severity = norm_severity(r.get("severity"))
+        file_path = r.get("path", "unknown file")
+        line = r.get("start_line", "?")
+        content = r.get("content", "")
+        finding = {
+            "tool": "ocr",
+            "rule": f"ocr/{category}",
+            "severity": severity,
+            "file": file_path,
+            "line": line,
+            "message": content,
+        }
+        suggestion = r.get("suggestion_code")
+        if suggestion:
+            finding["fix"] = suggestion
+        findings.append(finding)
+    return findings, None
+
+
 # filename (in results dir) -> (parser, tool label)
 PARSERS = {
     "semgrep.sarif": (lambda p: parse_sarif(p, "semgrep"), "semgrep"),
@@ -705,7 +818,55 @@ PARSERS = {
     "gitleaks.json": (parse_gitleaks, "gitleaks"),
     "trufflehog.jsonl": (parse_trufflehog, "trufflehog"),
     "retire.json": (parse_retire, "retire"),
+    # IaC security scanners — Terraform/K8s/Docker/CloudFormation
+    "checkov.json": (parse_checkov, "checkov"),
+    "tfsec.json": (parse_tfsec, "tfsec"),
+    # AI-powered code review — opt-in via --ocr / --ocr-delegate.
+    "ocr.json": (parse_ocr, "ocr"),
 }
+
+
+# Proximity window (lines) for cross-tool CWE dedup tier 3.
+# Tools may report slightly different line numbers for the same issue;
+# 5 lines is generous enough to catch most off-by-a-few cases without
+# merging unrelated findings.
+_PROXIMITY_LINES = 5
+
+
+def _merge_confirmation(deduped, f):
+    """Merge a duplicate finding's tool into the surviving entry's confirmed_by.
+
+    When two tools flag the same issue (different rule IDs, same CWE+location),
+    the dedup keeps the first (higher-priority tool) but records that the
+    second tool also confirmed it. This `confirmed_by` list is used downstream
+    for triage: findings confirmed by 2+ tools are more likely true positives.
+    """
+    if not deduped:
+        return
+    surviving = deduped[-1]
+    tool = f.get("tool", "")
+    if tool and tool != surviving.get("tool"):
+        confirmed = surviving.setdefault("confirmed_by", [])
+        if tool not in confirmed:
+            confirmed.append(tool)
+
+
+def _proximity_match(deduped, proximity_list, f):
+    """Check if finding ``f`` matches any existing finding within ±5 lines + same CWE.
+
+    Returns True if a proximity match is found (caller should skip this
+    finding). The proximity list is a list of (file, line_int, cwe, idx) tuples.
+    """
+    try:
+        f_line = int(f["line"])
+    except (ValueError, TypeError):
+        return False
+    f_file = f["file"]
+    f_cwe = f.get("cwe")
+    for p_file, p_line, p_cwe, _idx in proximity_list:
+        if p_file == f_file and p_cwe == f_cwe and abs(p_line - f_line) <= _PROXIMITY_LINES:
+            return True
+    return False
 
 
 def collect_findings(results_dir):
@@ -729,13 +890,44 @@ def collect_findings(results_dir):
     # may flag the same issue at the same file:line:rule. Keep the first
     # occurrence (tools are iterated in PARSERS order, which lists semgrep
     # first — its findings win ties).
-    seen = set()
+    # Three-tier dedup:
+    #   1. Exact: same (file, line, rule) — always deduped.
+    #   2. Cross-tool CWE: same (file, line) with same CWE — deduped, keeping
+    #      the first (higher-priority tool).
+    #   3. Proximity CWE: same file, same CWE, lines within ±5 — deduped.
+    #      Catches cases where tools report slightly different line numbers
+    #      for the same underlying issue.
+    # Multi-tool confirmation: when dedup merges findings from different tools,
+    # the surviving finding gets a `confirmed_by` list for triage priority.
+    seen_exact = set()
+    seen_cwe_by_location = {}  # (file, line) -> set of CWE ids
+    seen_cwe_by_proximity = []  # list of (file, line_int, cwe, idx_in_deduped)
     deduped = []
     for f in all_findings:
         key = (f["file"], str(f["line"]), f["rule"])
-        if key in seen:
+        if key in seen_exact:
+            # Same exact finding — attribute to existing entry's confirmed_by.
+            _merge_confirmation(deduped, f)
             continue
-        seen.add(key)
+        seen_exact.add(key)
+        cwe = f.get("cwe")
+        loc = (f["file"], str(f["line"]))
+        # Tier 2: exact location + same CWE.
+        if cwe and loc in seen_cwe_by_location and cwe in seen_cwe_by_location[loc]:
+            _merge_confirmation(deduped, f)
+            continue
+        # Tier 3: proximity (±5 lines) + same CWE on same file.
+        if cwe and _proximity_match(deduped, seen_cwe_by_proximity, f):
+            _merge_confirmation(deduped, f)
+            continue
+        if cwe:
+            seen_cwe_by_location.setdefault(loc, set()).add(cwe)
+            try:
+                line_int = int(f["line"])
+            except (ValueError, TypeError):
+                line_int = None
+            if line_int is not None:
+                seen_cwe_by_proximity.append((f["file"], line_int, cwe, len(deduped)))
         deduped.append(f)
     # P0.6: redact known secret shapes from any free-text field before the
     # report is written. A hardcoded credential surfacing in a SARIF message
@@ -856,10 +1048,120 @@ def render_report(results_dir, findings, parse_errors, manifest):
     return "\n".join(lines)
 
 
+def render_html_report(results_dir, findings, parse_errors, manifest):
+    """Render a self-contained HTML report with severity-colored cards.
+
+    The HTML is a single file with inline CSS — no external dependencies.
+    Findings are grouped by severity (critical → info) with color-coded badges.
+    """
+    import html as html_mod
+    by_sev = defaultdict(int)
+    for f in findings:
+        by_sev[f["severity"]] += 1
+    sev_colors = {
+        "critical": "#d32f2f", "high": "#f57c00", "medium": "#fbc02d",
+        "low": "#388e3c", "info": "#1976d2", "unknown": "#757575",
+    }
+    target = html_mod.escape(manifest.get("target", results_dir))
+    langs = ", ".join(manifest.get("languages", [])) or "(none detected)"
+    ts = html_mod.escape(manifest.get("timestamp", ""))
+    parts = [
+        "<!DOCTYPE html>",
+        '<html lang="en"><head><meta charset="utf-8">',
+        f"<title>Security Audit Report — {target}</title>",
+        "<style>",
+        "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }",
+        "h1 { margin-bottom: 0.5rem; } .meta { color: #666; margin-bottom: 2rem; }",
+        ".summary { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }",
+        ".badge { padding: 0.25rem 0.75rem; border-radius: 4px; color: white; font-weight: 600; font-size: 0.85rem; }",
+        ".finding { border-left: 4px solid #ccc; padding: 0.5rem 1rem; margin-bottom: 0.75rem; background: #fafafa; }",
+        ".finding .loc { font-family: monospace; font-size: 0.9rem; }",
+        ".finding .msg { margin-top: 0.25rem; }",
+        ".confirmed { color: #1976d2; font-size: 0.8rem; }",
+        "</style></head><body>",
+        f"<h1>Security Audit Report</h1>",
+        f'<div class="meta">Target: <code>{target}</code><br>Languages: {html_mod.escape(langs)}<br>Generated: {ts}</div>',
+        '<div class="summary">',
+    ]
+    for sev in SEVERITY_ORDER:
+        cnt = by_sev.get(sev, 0)
+        if cnt:
+            color = sev_colors.get(sev, "#757575")
+            parts.append(f'<span class="badge" style="background:{color}">{sev.upper()}: {cnt}</span>')
+    parts.append(f'<span class="badge" style="background:#424242">Total: {len(findings)}</span>')
+    parts.append("</div>")
+    if not findings:
+        parts.append("<p>No findings. This does not guarantee the code is free of security issues.</p>")
+    else:
+        findings_sorted = sorted(
+            findings,
+            key=lambda f: (SEVERITY_RANK.get(f["severity"], 99), f["file"], _line_sort_key(f["line"])),
+        )
+        current_sev = None
+        for f in findings_sorted:
+            if f["severity"] != current_sev:
+                if current_sev is not None:
+                    parts.append("</div>")
+                current_sev = f["severity"]
+                color = sev_colors.get(current_sev, "#757575")
+                parts.append(f'<h2 style="color:{color}">{current_sev.capitalize()}</h2><div>')
+            tool_rule = html_mod.escape(f"{f['tool']}:{f['rule']}")
+            loc = html_mod.escape(f"{f['file']}:{f['line']}")
+            msg = html_mod.escape(f.get("message", ""))
+            confirmed = f.get("confirmed_by", [])
+            confirmed_html = ""
+            if confirmed:
+                confirmed_html = f' <span class="confirmed">(confirmed by: {html_mod.escape(", ".join(confirmed))})</span>'
+            parts.append(
+                f'<div class="finding" style="border-color:{sev_colors.get(f["severity"], "#ccc")}">'
+                f'<span class="loc">[{tool_rule}] {loc}</span>'
+                f'<div class="msg">{msg}{confirmed_html}</div></div>'
+            )
+        parts.append("</div>")
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
+
+def render_json_report(results_dir, findings, parse_errors, manifest):
+    """Render a JSON report with all findings and metadata.
+
+    Machine-readable format for downstream tooling (dashboards, CI gates,
+    trend tracking). Same structure as the Markdown report but as JSON.
+    """
+    by_sev = defaultdict(int)
+    for f in findings:
+        by_sev[f["severity"]] += 1
+    return json.dumps({
+        "target": manifest.get("target", results_dir),
+        "languages": manifest.get("languages", []),
+        "timestamp": manifest.get("timestamp", ""),
+        "summary": {"total": len(findings), **dict(by_sev)},
+        "skipped_tools": manifest.get("skipped", []),
+        "parse_errors": parse_errors,
+        "findings": findings,
+    }, indent=2)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("results_dir")
     parser.add_argument("--out", default=None)
+    parser.add_argument(
+        "--format",
+        choices=["md", "html", "json", "all"],
+        default="md",
+        help="Output format (default: md). 'all' writes md + html + json.",
+    )
+    parser.add_argument(
+        "--triage",
+        action="store_true",
+        help="Generate LLM triage prompt for false positive assessment.",
+    )
+    parser.add_argument(
+        "--trend",
+        action="store_true",
+        help="Include trend comparison with previous scans in the report.",
+    )
     args = parser.parse_args()
 
     results_dir = os.path.abspath(args.results_dir)
@@ -870,13 +1172,195 @@ def main():
             manifest = json.load(f)
 
     findings, parse_errors = collect_findings(results_dir)
-    report = render_report(results_dir, findings, parse_errors, manifest)
 
-    out_path = args.out or os.path.join(results_dir, "report.md")
-    with open(out_path, "w") as f:
-        f.write(report)
+    # Save trend entry for this scan.
+    save_trend_entry(results_dir, findings, manifest)
 
-    print(f"Report written to {out_path} ({len(findings)} findings)")
+    # Load trend history if --trend requested.
+    trend_section = ""
+    if args.trend:
+        history = load_trend_history(results_dir)
+        trend_section = render_trend_section(history, findings)
+
+    # Generate triage prompt if --triage requested.
+    if args.triage and findings:
+        prompt = generate_triage_prompt(findings)
+        triage_path = args.out and args.out.replace(".md", ".triage.txt") or os.path.join(results_dir, "triage_prompt.txt")
+        with open(triage_path, "w") as f:
+            f.write(prompt)
+        print(f"Triage prompt written to {triage_path} ({len(findings)} findings)")
+
+    formats = ["md", "html", "json"] if args.format == "all" else [args.format]
+    for fmt in formats:
+        if fmt == "md":
+            report = render_report(results_dir, findings, parse_errors, manifest)
+            if trend_section:
+                report += "\n" + trend_section
+            out_path = args.out or os.path.join(results_dir, "report.md")
+            with open(out_path, "w") as f:
+                f.write(report)
+            print(f"Markdown report written to {out_path} ({len(findings)} findings)")
+        elif fmt == "html":
+            report = render_html_report(results_dir, findings, parse_errors, manifest)
+            out_path = args.out or os.path.join(results_dir, "report.html")
+            with open(out_path, "w") as f:
+                f.write(report)
+            print(f"HTML report written to {out_path} ({len(findings)} findings)")
+        elif fmt == "json":
+            report = render_json_report(results_dir, findings, parse_errors, manifest)
+            out_path = args.out or os.path.join(results_dir, "report.json")
+            with open(out_path, "w") as f:
+                f.write(report)
+            print(f"JSON report written to {out_path} ({len(findings)} findings)")
+
+
+def generate_triage_prompt(findings, context=None):
+    """Generate an LLM prompt for triaging findings as true/false positives.
+
+    The prompt asks the LLM to assess each finding's likelihood of being a
+    true positive based on the code context. Findings confirmed by multiple
+    tools are highlighted as higher-confidence. The output is a JSON array
+    of {finding_idx, verdict, confidence, reasoning} objects.
+
+    This is a deterministic prompt generator — the LLM itself does the
+    classification. The prompt is structured so the LLM's response can be
+    parsed programmatically.
+    """
+    lines = [
+        "You are a security analyst triaging SAST findings. For each finding below,",
+        "assess whether it is likely a TRUE POSITIVE or FALSE POSITIVE.",
+        "",
+        "Consider:",
+        "- Is the code path actually reachable?",
+        "- Is there existing sanitization/validation?",
+        "- Is this a test file or dead code?",
+        "- Findings confirmed by multiple tools are more likely true positives.",
+        "",
+        "Respond with a JSON array of objects:",
+        '[{"index": 0, "verdict": "true_positive|false_positive", "confidence": "high|medium|low", "reasoning": "..."}]',
+        "",
+        "Findings:",
+    ]
+    for i, f in enumerate(findings):
+        confirmed = f.get("confirmed_by", [])
+        confirmed_note = f" (confirmed by: {', '.join(confirmed)})" if confirmed else ""
+        lines.append(
+            f"{i}. [{f.get('severity', '?').upper()}] {f.get('tool', '?')}:{f.get('rule', '?')} "
+            f"at {f.get('file', '?')}:{f.get('line', '?')}{confirmed_note}"
+        )
+        lines.append(f"   Message: {f.get('message', '')}")
+        if f.get("fix"):
+            lines.append(f"   Suggested fix: {f['fix']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def load_trend_history(results_dir, max_entries=10):
+    """Load recent scan trend data from ~/.tiangang/trends/<project-hash>/.
+
+    Returns a list of {timestamp, total, by_severity} dicts sorted by time.
+    Used to show whether findings are increasing/decreasing over time.
+    """
+    import hashlib
+    manifest_path = os.path.join(results_dir, "scan_manifest.json")
+    if not os.path.exists(manifest_path):
+        return []
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    target = manifest.get("target", "")
+    proj_hash = hashlib.sha256(target.encode()).hexdigest()[:16]
+    trend_dir = os.path.join(
+        os.path.expanduser("~"), ".tiangang", "trends", proj_hash
+    )
+    os.makedirs(trend_dir, exist_ok=True)
+    # Load existing trend file.
+    trend_file = os.path.join(trend_dir, "trend_history.json")
+    history = []
+    if os.path.exists(trend_file):
+        try:
+            with open(trend_file) as f:
+                history = json.load(f)
+        except Exception:
+            history = []
+    return history[-max_entries:]
+
+
+def save_trend_entry(results_dir, findings, manifest):
+    """Append a trend entry with current scan's finding counts.
+
+    Called after each scan to build up trend history. The trend data is
+    stored per-project (by target path hash) so different projects don't
+    mix their histories.
+    """
+    import hashlib
+    target = manifest.get("target", "")
+    proj_hash = hashlib.sha256(target.encode()).hexdigest()[:16]
+    trend_dir = os.path.join(
+        os.path.expanduser("~"), ".tiangang", "trends", proj_hash
+    )
+    os.makedirs(trend_dir, exist_ok=True)
+    trend_file = os.path.join(trend_dir, "trend_history.json")
+    history = []
+    if os.path.exists(trend_file):
+        try:
+            with open(trend_file) as f:
+                history = json.load(f)
+        except Exception:
+            history = []
+    by_sev = defaultdict(int)
+    for f in findings:
+        by_sev[f["severity"]] += 1
+    entry = {
+        "timestamp": manifest.get("timestamp", ""),
+        "total": len(findings),
+        "by_severity": dict(by_sev),
+    }
+    history.append(entry)
+    # Keep last 50 entries.
+    history = history[-50:]
+    with open(trend_file, "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def render_trend_section(history, current_findings):
+    """Render a trend section for the Markdown report.
+
+    Shows whether findings are increasing/decreasing compared to recent scans.
+    """
+    if not history:
+        return ""
+    lines = ["## Scan Trend", ""]
+    lines.append("| Scan | Total | Critical | High | Medium | Low |")
+    lines.append("|---|---|---|---|---|---|")
+    for entry in history[-5:]:
+        ts = entry.get("timestamp", "")[:10]
+        by_sev = entry.get("by_severity", {})
+        lines.append(
+            f"| {ts} | {entry.get('total', 0)} | "
+            f"{by_sev.get('critical', 0)} | {by_sev.get('high', 0)} | "
+            f"{by_sev.get('medium', 0)} | {by_sev.get('low', 0)} |"
+        )
+    # Current scan.
+    cur_sev = defaultdict(int)
+    for f in current_findings:
+        cur_sev[f["severity"]] += 1
+    lines.append(
+        f"| **Current** | **{len(current_findings)}** | "
+        f"**{cur_sev.get('critical', 0)}** | **{cur_sev.get('high', 0)}** | "
+        f"**{cur_sev.get('medium', 0)}** | **{cur_sev.get('low', 0)}** |"
+    )
+    # Delta.
+    if history:
+        prev_total = history[-1].get("total", 0)
+        delta = len(current_findings) - prev_total
+        if delta > 0:
+            lines.append(f"\n**+{delta}** new findings since last scan.")
+        elif delta < 0:
+            lines.append(f"\n**{delta}** findings resolved since last scan.")
+        else:
+            lines.append("\nNo change since last scan.")
+    lines.append("")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

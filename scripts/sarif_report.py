@@ -171,18 +171,34 @@ def _build_rules(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
-def to_sarif(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+def to_sarif(findings: List[Dict[str, Any]], manifest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Aggregate normalized findings into a SARIF 2.1.0 document.
 
     Findings without a usable file location are skipped (SARIF requires a
     physicalLocation); the caller is expected to surface that count.
+
+    ``manifest`` is the scan_manifest.json dict (optional). When provided, it
+    populates run.automationDetails with scan metadata for traceability.
     """
     results: List[Dict[str, Any]] = []
     for f in findings:
         res = _result_from_finding(f)
         if res is not None:
+            # Add confirmed_by to properties when multiple tools flagged it.
+            if f.get("confirmed_by"):
+                res["properties"]["confirmed_by"] = f["confirmed_by"]
             results.append(res)
     rules = _build_rules(results)
+    # automationDetails: embed scan metadata for traceability in CI systems.
+    automation: Dict[str, Any] = {
+        "id": {"text": "tiangang-aggregated-scan"},
+    }
+    if manifest:
+        automation["id"]["text"] = f"tiangang-{manifest.get('timestamp', '')[:19].replace(':', '-')}"
+        if manifest.get("target"):
+            automation["logicalLocations"] = [
+                {"fullyQualifiedName": manifest["target"], "kind": "namespace"}
+            ]
     return {
         "$schema": SARIF_SCHEMA,
         "version": SARIF_VERSION,
@@ -196,6 +212,7 @@ def to_sarif(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
                         "rules": rules,
                     }
                 },
+                "automationDetails": automation,
                 "results": results,
             }
         ],
@@ -287,12 +304,22 @@ def main() -> int:
         for e in parse_errors:
             print(f"warning: {e}", file=sys.stderr)
 
+    # Load scan manifest for automationDetails metadata.
+    manifest: Dict[str, Any] = {}
+    manifest_path = os.path.join(results_dir, "scan_manifest.json")
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+        except Exception:
+            pass
+
     # Findings without a usable file location are skipped by to_sarif (SARIF
     # requires a physicalLocation). Surface that count so the user knows the
     # aggregated total may be smaller than the parsed total — silent truncation
     # would read as "everything made it" when it didn't (Rule: failures must
     # be explicit).
-    sarif = to_sarif(findings)
+    sarif = to_sarif(findings, manifest=manifest)
     emitted = len(sarif["runs"][0]["results"])
     skipped = len(findings) - emitted
     if skipped > 0:
