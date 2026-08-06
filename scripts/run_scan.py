@@ -28,10 +28,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -594,14 +596,248 @@ def _retire_thunk(target, out_dir):
     return _run
 
 
-def _ocr_thunk(target, out_dir, ocr_mode="scan"):
+def _ocr_detect_project_type(target):
+    """Detect project type from manifest files and return a review background.
+
+    Mirrors ocr_scan.sh's detect_background() — checks for Cargo.toml (Rust),
+    go.mod (Go), package.json (Node/TS), requirements.txt/pyproject.toml (Python),
+    pubspec.yaml (Flutter/Dart). Returns a language-specific multi-dimension
+    review background string that OCR passes to the LLM as context.
+    """
+    if os.path.isfile(os.path.join(target, "Cargo.toml")):
+        return (
+            "Rust项目全维度深度审查。必须覆盖以下全部维度：\n"
+            "1.安全性: SQL注入/XSS/CSRF/路径注入/命令注入/敏感信息泄露/权限校验缺失\n"
+            "2.线程安全与并发: 竞态条件/非原子复合操作/Mutex guard生命周期/跨.await持锁/原子操作ordering\n"
+            "3.错误处理: unwrap/expect滥用/异常吞没/过早丢弃错误上下文/错误传播缺失\n"
+            "4.所有权与生命周期: 引用逃逸/不必要clone/内部可变性滥用/引用循环/生命周期标注缺失\n"
+            "5.Unsafe边界: unsafe块过大/缺少安全不变量文档/FFI边界未校验\n"
+            "6.Async与取消安全: JoinHandle被丢弃/Future非取消安全/async中用同步IO\n"
+            "7.性能: 循环内数据库查询(N+1)/O(n^2)查找/不必要分配/未预分配集合/热路径锁竞争\n"
+            "8.测试覆盖: 关键逻辑路径是否有测试/边界条件覆盖"
+        )
+    if os.path.isfile(os.path.join(target, "go.mod")):
+        return (
+            "Go项目全维度深度审查。必须覆盖：\n"
+            "1.安全性: SQL注入/XSS/命令注入/敏感信息泄露/权限校验\n"
+            "2.并发安全: goroutine泄漏/channel死锁/竞态条件/Mutex使用/WaitGroup遗漏\n"
+            "3.错误处理: error wrapping(%w)/defer资源释放/panic恢复/error返回值检查\n"
+            "4.context传播: 超时传递/cancel传播/context.Value滥用\n"
+            "5.接口设计: 小接口原则/错误类型设计/选项模式\n"
+            "6.性能: 内存分配/切片预分配/字符串拼接\n"
+            "7.测试覆盖: 表驱动测试/边界条件/mock注入"
+        )
+    if os.path.isfile(os.path.join(target, "package.json")):
+        return (
+            "Node.js/TypeScript项目全维度深度审查。必须覆盖：\n"
+            "1.安全性: XSS/注入/原型污染/敏感信息泄露/依赖漏洞\n"
+            "2.类型安全: any滥用/类型断言安全/泛型约束/null/undefined处理\n"
+            "3.异步: Promise错误处理/未await/内存泄漏(事件监听器)/并发控制\n"
+            "4.性能: 热路径分配/N+1查询/大数组操作\n"
+            "5.可维护性: 命名/模块边界/循环依赖\n"
+            "6.测试覆盖: 单元测试/mock/边界条件"
+        )
+    if (os.path.isfile(os.path.join(target, "requirements.txt"))
+            or os.path.isfile(os.path.join(target, "pyproject.toml"))):
+        return (
+            "Python项目全维度深度审查。覆盖："
+            "安全性/异常处理/类型提示/可变默认参数/性能/测试"
+        )
+    if os.path.isfile(os.path.join(target, "pubspec.yaml")):
+        return (
+            "Flutter/Dart项目全维度深度审查。覆盖："
+            "安全性/Widget重建性能/Stream泄漏/空安全/异步/测试"
+        )
+    return "通用项目全维度深度审查。覆盖：安全性/错误处理/并发/性能/可维护性/测试"
+
+
+def _ocr_setup_env():
+    """Configure OCR environment variables and verify LLM connectivity.
+
+    Token priority: OCR_LLM_TOKEN > AGNES_TOKEN (mapped to OCR_LLM_TOKEN).
+    Sets defaults for OCR_LLM_URL, OCR_LLM_MODEL, OCR_LLM_PROTOCOL when not
+    already configured. Returns (ok: bool, error_msg: str|None).
+    """
+    token = os.environ.get("OCR_LLM_TOKEN", "").strip()
+    if not token:
+        agnes = os.environ.get("AGNES_TOKEN", "").strip()
+        if agnes:
+            os.environ["OCR_LLM_TOKEN"] = agnes
+            token = agnes
+        else:
+            return False, (
+                "OCR API key not set. Export AGNES_TOKEN=<key> or "
+                "OCR_LLM_TOKEN=<key> before running with --ocr."
+            )
+    # Defaults for endpoint configuration (absorbed from ocr_scan.sh).
+    os.environ.setdefault("OCR_LLM_URL", "https://apihub.agnes-ai.com/v1/chat/completions")
+    os.environ.setdefault("OCR_LLM_MODEL", "agnes-2.5-flash")
+    os.environ.setdefault("OCR_LLM_PROTOCOL", "openai")
+    # Connectivity test — fail fast before launching a long scan.
+    try:
+        proc = subprocess.run(
+            ["ocr", "llm", "test"],
+            capture_output=True, text=True, timeout=30,
+        )
+        combined = (proc.stdout or "") + (proc.stderr or "")
+        if "✓" not in combined and proc.returncode != 0:
+            return False, (
+                f"OCR LLM connectivity test failed (rc={proc.returncode}). "
+                f"Check OCR_LLM_TOKEN and network. Output: {combined[-200:]}"
+            )
+    except subprocess.TimeoutExpired:
+        return False, "OCR LLM connectivity test timed out (30s)"
+    except FileNotFoundError:
+        return False, "ocr CLI not found — run install_tools.sh first"
+    except Exception as e:
+        return False, f"OCR LLM connectivity test error: {e}"
+    return True, None
+
+
+def _ocr_find_subdirs(target):
+    """Find immediate subdirectories containing source files for batch scanning.
+
+    Mirrors ocr_scan.sh's directory discovery — scans each top-level directory
+    separately to stay within rate limits, with a delay between batches.
+    Returns a list of relative paths (relative to target).
+    """
+    src_exts = {".rs", ".go", ".ts", ".tsx", ".js", ".jsx", ".py", ".dart",
+                ".java", ".rb", ".php", ".c", ".cpp", ".h", ".cs"}
+    subdirs = []
+    try:
+        entries = sorted(os.listdir(target))
+    except OSError:
+        return subdirs
+    for entry in entries:
+        full = os.path.join(target, entry)
+        if not os.path.isdir(full) or entry.startswith("."):
+            continue
+        # Check if this directory has any source files (shallow walk).
+        for root, dirs, files in os.walk(full):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+            if any(os.path.splitext(f)[1].lower() in src_exts for f in files):
+                subdirs.append(entry)
+                break
+    return subdirs
+
+
+def _ocr_extract_session_findings(target, out_dir):
+    """Extract findings from OCR session JSONL files (richer than --format json).
+
+    OCR stores detailed session data under ~/.opencodereview/sessions/ as JSONL.
+    Each line with type=tool_call may carry review comments with severity,
+    category, and content. This parser extracts and deduplicates those findings,
+    writing them to ocr-session.json for the report parser.
+
+    Returns the list of findings (may be empty if no session data found).
+    """
+    session_base = os.path.join(os.path.expanduser("~"), ".opencodereview", "sessions")
+    if not os.path.isdir(session_base):
+        return []
+    # Try to match by project slug first, fall back to recent sessions.
+    project_slug = re.sub(r"[^a-zA-Z0-9]", "-", os.path.basename(os.path.abspath(target)))
+    session_dir = None
+    try:
+        for entry in sorted(os.listdir(session_base), reverse=True):
+            full = os.path.join(session_base, entry)
+            if not os.path.isdir(full):
+                continue
+            if project_slug in entry:
+                session_dir = full
+                break
+        if session_dir is None:
+            # Fallback: most recently modified session dir (within 2 hours).
+            now = time.time()
+            for entry in sorted(os.listdir(session_base), reverse=True):
+                full = os.path.join(session_base, entry)
+                if not os.path.isdir(full):
+                    continue
+                try:
+                    mtime = os.path.getmtime(full)
+                    if now - mtime < 7200:  # 2 hours
+                        session_dir = full
+                        break
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    if session_dir is None:
+        return []
+    # Parse all JSONL files in the session directory.
+    findings = []
+    seen = set()
+    try:
+        jsonl_files = sorted(
+            [os.path.join(session_dir, f) for f in os.listdir(session_dir)
+             if f.endswith(".jsonl")],
+            key=os.path.getmtime, reverse=True,
+        )
+    except OSError:
+        return []
+    for jsonl_path in jsonl_files:
+        try:
+            with open(jsonl_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("type") != "tool_call":
+                        continue
+                    fp = d.get("filePath", "")
+                    args_raw = d.get("arguments", "")
+                    if not fp or not args_raw:
+                        continue
+                    try:
+                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    except json.JSONDecodeError:
+                        continue
+                    for comment in (args.get("comments") or []):
+                        content = comment.get("content", "")
+                        key = (fp, content[:80])
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        sev_raw = comment.get("severity", comment.get("level", "unknown"))
+                        cat_raw = comment.get("category", comment.get("rule", "other"))
+                        findings.append({
+                            "path": fp,
+                            "content": content,
+                            "severity": str(sev_raw).lower(),
+                            "category": str(cat_raw).lower(),
+                            "start_line": comment.get("lines", comment.get("line_range", "?")),
+                            "suggestion_code": comment.get("suggestion_code", ""),
+                        })
+        except OSError:
+            continue
+    # Write session findings to ocr-session.json for the parser.
+    if findings:
+        session_out = os.path.join(out_dir, "ocr-session.json")
+        try:
+            with open(session_out, "w") as f:
+                json.dump(findings, f)
+        except OSError:
+            pass
+    return findings
+
+
+def _ocr_thunk(target, out_dir, ocr_mode="scan",
+               ocr_background="", ocr_delay=5, ocr_retry=2, ocr_timeout=60):
     """OCR (open-code-review) AI-powered code review thunk.
 
     Two modes:
-      - ``scan``: ``ocr scan --format json`` — reviews whole files/dirs,
-        no git history needed. Best for auditing unfamiliar codebases.
-      - ``review``: ``ocr review --format json`` — reviews git diffs
-        (staged + unstaged + untracked). Best for PR/commit review.
+      - ``scan``: ``ocr scan`` — reviews whole files/dirs, no git needed.
+        Uses batch scanning by subdirectory with rate-limit delays and
+        failure retry (absorbed from ocr_scan.sh).
+      - ``review``: ``ocr review`` — reviews git diffs (staged + unstaged).
+        Best for PR/commit review. No batching needed (diff is bounded).
+
+    Environment setup (token, connectivity) is handled by _ocr_setup_env().
+    Project-type-aware review background is generated by
+    _ocr_detect_project_type() and merged with user-supplied --ocr-background.
 
     OCR exits non-zero when findings exist — that's a finding, not a
     failure. Normalize rc=1 → 0 when the report file was produced.
@@ -610,31 +846,143 @@ def _ocr_thunk(target, out_dir, ocr_mode="scan"):
     def _run():
         r = []
         out_path = os.path.join(out_dir, "ocr.json")
+
+        # --- Environment setup ---
+        ok, err_msg = _ocr_setup_env()
+        if not ok:
+            r.append({
+                "tool": "ocr", "command": "",
+                "returncode": -1,
+                "log_tail": f"[ocr env setup failed] {err_msg}",
+            })
+            return r
+
+        # --- Build background string ---
+        lang_bg = _ocr_detect_project_type(target)
+        if ocr_background:
+            full_background = f"{lang_bg}\n\n额外关注: {ocr_background}"
+        else:
+            full_background = lang_bg
+
         if ocr_mode == "review":
+            # Git diff-based review — no batching needed.
             cmd = [
                 "ocr", "review",
                 "--format", "json",
                 "--audience", "agent",
             ]
-            run_tool("ocr", r, cmd, cwd=target, timeout=900)
+            run_tool("ocr", r, cmd, cwd=target, timeout=ocr_timeout * 10)
+            # rc=1 means findings found — normalize to 0 when report exists.
+            if r and r[-1]["returncode"] == 1 and os.path.exists(out_path):
+                r[-1]["returncode"] = 0
+                r[-1]["log_tail"] = (
+                    (r[-1].get("log_tail") or "")
+                    + "\n[ocr rc=1 normalized: findings detected, not a failure]"
+                )
         else:
-            cmd = [
-                "ocr", "scan",
-                "--format", "json",
-                "--output", out_path,
-                target,
-            ]
-            run_tool("ocr", r, cmd, timeout=900)
-        # rc=1 means findings found — normalize to 0 when report exists.
-        if r and r[-1]["returncode"] == 1 and os.path.exists(out_path):
-            r[-1]["returncode"] = 0
-            r[-1]["log_tail"] = (
-                (r[-1].get("log_tail") or "")
-                + "\n[ocr rc=1 normalized: findings detected, not a failure]"
-            )
-        return r
+            # --- Batch scanning mode (absorbed from ocr_scan.sh) ---
+            subdirs = _ocr_find_subdirs(target)
+            if not subdirs:
+                # No subdirectories — single scan of the whole target.
+                cmd = [
+                    "ocr", "scan",
+                    "--format", "json",
+                    "--output", out_path,
+                    "--concurrency", "1",
+                    "--background", full_background,
+                    "--timeout", str(ocr_timeout),
+                    target,
+                ]
+                run_tool("ocr", r, cmd, timeout=ocr_timeout * 10)
+            else:
+                # Batch by subdirectory with delays between batches.
+                all_findings = []
+                failed_files = set()
+                for i, subdir in enumerate(subdirs):
+                    if i > 0:
+                        time.sleep(ocr_delay)
+                    batch_out = os.path.join(out_dir, f"ocr_batch_{i}.json")
+                    cmd = [
+                        "ocr", "scan",
+                        "--path", subdir,
+                        "--concurrency", "1",
+                        "--background", full_background,
+                        "--format", "json",
+                        "--output", batch_out,
+                        "--timeout", str(ocr_timeout),
+                    ]
+                    batch_ran = []
+                    run_tool("ocr", batch_ran, cmd, cwd=target,
+                             timeout=ocr_timeout * 10)
+                    r.extend(batch_ran)
+                    # Collect findings from this batch.
+                    if os.path.exists(batch_out):
+                        try:
+                            with open(batch_out) as f:
+                                batch_data = json.load(f)
+                            if isinstance(batch_data, list):
+                                all_findings.extend(batch_data)
+                        except (json.JSONDecodeError, OSError):
+                            pass
+                    # Track failed files for retry.
+                    log_tail = batch_ran[-1].get("log_tail", "") if batch_ran else ""
+                    for m in re.finditer(r"Scan subtask error for (\S+)", log_tail):
+                        failed_files.add(m.group(1))
 
-    return _run
+                # --- Retry failed files ---
+                for retry_round in range(ocr_retry):
+                    if not failed_files:
+                        break
+                    time.sleep(ocr_delay)
+                    retry_list = sorted(failed_files)
+                    failed_files = set()
+                    retry_csv = ",".join(retry_list)
+                    retry_out = os.path.join(out_dir, f"ocr_retry_{retry_round}.json")
+                    cmd = [
+                        "ocr", "scan",
+                        "--path", retry_csv,
+                        "--concurrency", "1",
+                        "--background", full_background,
+                        "--format", "json",
+                        "--output", retry_out,
+                        "--timeout", str(ocr_timeout),
+                    ]
+                    retry_ran = []
+                    run_tool("ocr", retry_ran, cmd, cwd=target,
+                             timeout=ocr_timeout * 10)
+                    r.extend(retry_ran)
+                    if os.path.exists(retry_out):
+                        try:
+                            with open(retry_out) as f:
+                                retry_data = json.load(f)
+                            if isinstance(retry_data, list):
+                                all_findings.extend(retry_data)
+                        except (json.JSONDecodeError, OSError):
+                            pass
+                    log_tail = retry_ran[-1].get("log_tail", "") if retry_ran else ""
+                    for m in re.finditer(r"Scan subtask error for (\S+)", log_tail):
+                        failed_files.add(m.group(1))
+
+                # Write merged findings to ocr.json.
+                if all_findings:
+                    try:
+                        with open(out_path, "w") as f:
+                            json.dump(all_findings, f)
+                    except OSError:
+                        pass
+
+            # Normalize rc for the last entry.
+            if r and r[-1]["returncode"] == 1 and os.path.exists(out_path):
+                r[-1]["returncode"] = 0
+                r[-1]["log_tail"] = (
+                    (r[-1].get("log_tail") or "")
+                    + "\n[ocr rc=1 normalized: findings detected, not a failure]"
+                )
+
+        # --- Session extraction (enriches report with detailed session data) ---
+        _ocr_extract_session_findings(target, out_dir)
+
+        return r
 
 
 def _checkov_thunk(target, out_dir):
@@ -852,7 +1200,9 @@ def _run_concurrently(tasks, sequential=False):
 # ---------------------------------------------------------------------------
 
 
-def _build_registry(target, out_dir, agent_rules, detect_info, ocr=False, ocr_delegate=False):
+def _build_registry(target, out_dir, agent_rules, detect_info,
+                     ocr=False, ocr_delegate=False,
+                     ocr_background="", ocr_delay=5, ocr_retry=2, ocr_timeout=60):
     """Build the tool registry with closures over target/out_dir/context.
 
     Separated from the dispatch loop so the registry is a plain data structure
@@ -1045,6 +1395,10 @@ def _build_registry(target, out_dir, agent_rules, detect_info, ocr=False, ocr_de
             "factory": lambda: _ocr_thunk(
                 target, out_dir,
                 "review" if ocr_delegate else "scan",
+                ocr_background=ocr_background,
+                ocr_delay=ocr_delay,
+                ocr_retry=ocr_retry,
+                ocr_timeout=ocr_timeout,
             ),
             "skip_reason": "opt-in — pass --ocr or --ocr-delegate to enable AI code review",
         },
@@ -1283,13 +1637,35 @@ def main():
         "--ocr",
         action="store_true",
         help="Enable AI-powered code review via open-code-review (ocr scan). "
-        "Opt-in: requires ocr CLI + LLM API configuration.",
+        "Opt-in: requires ocr CLI + LLM API configuration (AGNES_TOKEN or OCR_LLM_TOKEN).",
     )
     parser.add_argument(
         "--ocr-delegate",
         action="store_true",
         help="Enable AI code review in delegate mode (ocr review). "
         "Uses git diff-based review. Priority over --ocr when both set.",
+    )
+    parser.add_argument(
+        "--ocr-background",
+        default="",
+        help="Additional review context appended to the auto-detected project "
+        "background. E.g. --ocr-background 'focus on auth module'.",
+    )
+    parser.add_argument(
+        "--ocr-delay",
+        type=int, default=5,
+        help="Delay in seconds between OCR batch scans (default: 5). "
+        "Prevents rate limiting with RPM=20.",
+    )
+    parser.add_argument(
+        "--ocr-retry",
+        type=int, default=2,
+        help="Max retry rounds for failed OCR files (default: 2).",
+    )
+    parser.add_argument(
+        "--ocr-timeout",
+        type=int, default=60,
+        help="Per-file timeout in minutes for OCR scans (default: 60).",
     )
     args = parser.parse_args()
 
@@ -1332,6 +1708,10 @@ def main():
     registry = _build_registry(
         target, out_dir, args.agent_rules, detect_info,
         ocr=args.ocr, ocr_delegate=args.ocr_delegate,
+        ocr_background=args.ocr_background,
+        ocr_delay=args.ocr_delay,
+        ocr_retry=args.ocr_retry,
+        ocr_timeout=args.ocr_timeout,
     )
     tasks, skipped = _dispatch_registry(registry, langs)
 
