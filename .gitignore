@@ -60,3 +60,4 @@ darwin-result-card.png
 .coverage
 htmlcov/
 # Specmark/openspec 临时产物
+open-code-review/
