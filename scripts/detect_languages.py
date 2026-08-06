@@ -45,6 +45,16 @@ EXT_MAP = {
     ".tsx": "javascript",
     ".mts": "javascript",
     ".cts": "javascript",
+    # IaC file extensions — Terraform, Kubernetes, Docker, CloudFormation.
+    ".tf": "iac",
+    ".hcl": "iac",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".swift": "swift",
+    ".scala": "scala",
+    ".dart": "dart",
+    ".ex": "elixir",
+    ".exs": "elixir",
 }
 
 # manifest file (relative to a directory) -> language, treated as a strong
@@ -66,6 +76,22 @@ MANIFEST_MAP = {
     "package.json": "javascript",
     "package-lock.json": "javascript",
     "tsconfig.json": "javascript",
+    # C/C++ build system files — strong signal for native code projects.
+    # Note: Makefile is NOT included as a strong signal here — many projects
+    # have Makefiles unrelated to C/C++ (e.g. Python build orchestration).
+    # Makefile is handled via extension-count weak signal instead. Only
+    # C/C++-specific build systems (CMakeLists, configure.ac, meson.build)
+    # are strong signals.
+    "CMakeLists.txt": "c_cpp",
+    "configure.ac": "c_cpp",
+    "meson.build": "c_cpp",
+    # IaC / infrastructure-as-code — triggers IaC security scanners (checkov/tfsec).
+    "main.tf": "iac",
+    "terraform.tf": "iac",
+    "Chart.yaml": "iac",
+    "Dockerfile": "iac",
+    "docker-compose.yml": "iac",
+    "docker-compose.yaml": "iac",
 }
 
 # directories that would otherwise pollute the extension counts with
@@ -83,6 +109,19 @@ SKIP_DIRS = {
     ".tox",
     "bin",
     "obj",
+    # Additional skip dirs — tool caches and IDE metadata that contain no
+    # user source code but can have thousands of files slowing traversal.
+    ".mypy_cache",
+    ".ruff_cache",
+    ".gradle",
+    ".idea",
+    ".vscode",
+    ".eslintcache",
+    ".pytest_cache",
+    ".coverage",
+    ".nyc_output",
+    "eggs",
+    ".eggs",
 }
 
 # extension-count threshold below which we treat a language as noise (e.g.
@@ -90,19 +129,47 @@ SKIP_DIRS = {
 MIN_FILE_COUNT = 3
 
 
-def detect(target: str):
+def detect(target: str, max_depth: int = 0):
+    """Detect languages in target dir.
+
+    Args:
+        target: directory to scan
+        max_depth: maximum directory depth to traverse (0 = unlimited).
+            Useful for large monorepos where full traversal is slow.
+
+    Returns:
+        (ordered, ext_counts, strong) tuple — same as before.
+    """
     strong = set()
     ext_counts = {}
+    target_depth = target.rstrip(os.sep).count(os.sep)
 
     for root, dirs, files in os.walk(target):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
-        for fname in files:
-            if fname in MANIFEST_MAP:
-                strong.add(MANIFEST_MAP[fname])
-            ext = os.path.splitext(fname)[1]
-            if ext in EXT_MAP:
-                lang = EXT_MAP[ext]
-                ext_counts[lang] = ext_counts.get(lang, 0) + 1
+        # Depth limiting: skip directories beyond max_depth.
+        if max_depth > 0:
+            current_depth = root.rstrip(os.sep).count(os.sep) - target_depth
+            if current_depth >= max_depth:
+                dirs.clear()
+                continue
+        try:
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+            for fname in files:
+                if fname in MANIFEST_MAP:
+                    strong.add(MANIFEST_MAP[fname])
+                ext = os.path.splitext(fname)[1]
+                if ext in EXT_MAP:
+                    lang = EXT_MAP[ext]
+                    ext_counts[lang] = ext_counts.get(lang, 0) + 1
+        except PermissionError:
+            # Skip directories we can't read — don't crash the whole scan.
+            # The report will show "partial coverage" via the skipped tools
+            # section if this causes scanners to miss files.
+            print(
+                f"warning: permission denied, skipping {root}",
+                file=sys.stderr,
+            )
+            dirs.clear()
+            continue
 
     weak = {lang for lang, count in ext_counts.items() if count >= MIN_FILE_COUNT}
 
@@ -119,13 +186,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("target")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--max-depth", type=int, default=0,
+        help="Maximum directory depth to traverse (0 = unlimited). "
+        "Useful for large monorepos.",
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(args.target):
         print(f"error: {args.target} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    ordered, ext_counts, strong = detect(args.target)
+    ordered, ext_counts, strong = detect(args.target, max_depth=args.max_depth)
 
     if not ordered:
         if args.json:
