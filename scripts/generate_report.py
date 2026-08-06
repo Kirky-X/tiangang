@@ -793,6 +793,25 @@ def parse_ocr(path):
     return findings, None
 
 
+def parse_ocr_session(path):
+    """Parse OCR session JSONL extraction (richer findings from session data).
+
+    _ocr_extract_session_findings() extracts detailed review comments from
+    OCR's session JSONL files (~/.opencodereview/sessions/) and writes them
+    to ocr-session.json. The format is the same as parse_ocr's expected input
+    (a JSON array of review comments), so the parsing logic is shared.
+
+    This parser exists as a separate entry so session-derived findings are
+    tagged distinctly from direct JSON output — the report can show both
+    sources when available.
+    """
+    findings, err = parse_ocr(path)
+    # Re-tag tool as "ocr/session" to distinguish from direct JSON output.
+    for f in findings:
+        f["tool"] = "ocr/session"
+    return findings, err
+
+
 # filename (in results dir) -> (parser, tool label)
 PARSERS = {
     "semgrep.sarif": (lambda p: parse_sarif(p, "semgrep"), "semgrep"),
@@ -823,6 +842,8 @@ PARSERS = {
     "tfsec.json": (parse_tfsec, "tfsec"),
     # AI-powered code review — opt-in via --ocr / --ocr-delegate.
     "ocr.json": (parse_ocr, "ocr"),
+    # Session-derived findings (richer data from OCR session JSONL files).
+    "ocr-session.json": (parse_ocr_session, "ocr/session"),
 }
 
 
