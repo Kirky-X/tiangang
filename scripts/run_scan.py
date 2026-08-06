@@ -1200,9 +1200,7 @@ def _run_concurrently(tasks, sequential=False):
 # ---------------------------------------------------------------------------
 
 
-def _build_registry(target, out_dir, agent_rules, detect_info,
-                     ocr=False, ocr_delegate=False,
-                     ocr_background="", ocr_delay=5, ocr_retry=2, ocr_timeout=60):
+def _build_registry(target, out_dir, agent_rules, detect_info):
     """Build the tool registry with closures over target/out_dir/context.
 
     Separated from the dispatch loop so the registry is a plain data structure
@@ -1383,24 +1381,6 @@ def _build_registry(target, out_dir, agent_rules, detect_info,
             "langs": {"iac"},
             "available": lambda: have("tfsec"),
             "factory": lambda: _tfsec_thunk(target, out_dir),
-        },
-        # --- AI-powered code review (opt-in) ---
-        # OCR adds an LLM-driven review layer on top of deterministic SAST.
-        # Disabled by default because it requires external LLM API access
-        # (unless ocr_delegate is set). Enable via --ocr or --ocr-delegate.
-        {
-            "name": "ocr",
-            "langs": None,
-            "available": lambda: (ocr or ocr_delegate) and have("ocr"),
-            "factory": lambda: _ocr_thunk(
-                target, out_dir,
-                "review" if ocr_delegate else "scan",
-                ocr_background=ocr_background,
-                ocr_delay=ocr_delay,
-                ocr_retry=ocr_retry,
-                ocr_timeout=ocr_timeout,
-            ),
-            "skip_reason": "opt-in — pass --ocr or --ocr-delegate to enable AI code review",
         },
     ]
 
@@ -1707,11 +1687,6 @@ def main():
     # _run_concurrently.
     registry = _build_registry(
         target, out_dir, args.agent_rules, detect_info,
-        ocr=args.ocr, ocr_delegate=args.ocr_delegate,
-        ocr_background=args.ocr_background,
-        ocr_delay=args.ocr_delay,
-        ocr_retry=args.ocr_retry,
-        ocr_timeout=args.ocr_timeout,
     )
     tasks, skipped = _dispatch_registry(registry, langs)
 
@@ -1747,6 +1722,30 @@ def main():
             )
 
     ran = _run_concurrently(tasks, sequential=args.sequential)
+
+    # --- OCR: separate post-scan step (not part of the concurrent pipeline) ---
+    # OCR is an LLM-driven review layer that runs AFTER deterministic SAST.
+    # It is never auto-dispatched — only triggered explicitly via --ocr or
+    # --ocr-delegate, and runs as an independent step so the normal scan
+    # completes first regardless of OCR's outcome.
+    if (args.ocr or args.ocr_delegate) and have("ocr"):
+        print("\n--- AI code review (OCR) ---")
+        ocr_mode = "review" if args.ocr_delegate else "scan"
+        ocr_thunk = _ocr_thunk(
+            target, out_dir, ocr_mode,
+            ocr_background=args.ocr_background,
+            ocr_delay=args.ocr_delay,
+            ocr_retry=args.ocr_retry,
+            ocr_timeout=args.ocr_timeout,
+        )
+        ocr_ran = list(ocr_thunk())
+        ran.extend(ocr_ran)
+        for entry in ocr_ran:
+            status = "ok" if entry.get("returncode", -1) == 0 else f"rc={entry.get('returncode', '?')}"
+            print(f"  OCR [{status}]: {entry.get('log_tail', '')[-120:]}")
+    elif args.ocr or args.ocr_delegate:
+        print("\nwarning: --ocr/--ocr-delegate set but ocr CLI not installed — skipping AI review",
+              file=sys.stderr)
 
     manifest = {
         "target": target,
