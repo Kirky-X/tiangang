@@ -26,6 +26,8 @@ bash scripts/sync-skills.sh tiangang
 
 # Option 2: manual copy into an agent skills directory
 cp -r tiangang/ ~/.zcode/skills/tiangang/
+# Option 3: Remote install (GitHub repo)
+npx skills add Kirky-X/tiangang --agent claude-code -y
 ```
 
 First-run requirements: Python 3.8+ only (scripts use the standard library). The scanners themselves (Semgrep/Bandit/Trivy, etc.) are installed on demand by `scripts/install_tools.sh` on first run; OCR needs `npm install -g @alibaba-group/open-code-review` plus an LLM API key (`AGNES_TOKEN` or `OCR_LLM_TOKEN`).

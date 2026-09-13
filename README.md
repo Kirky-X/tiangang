@@ -25,6 +25,8 @@ bash scripts/sync-skills.sh tiangang
 
 # 方式 2：手动拷贝到 agent 技能目录
 cp -r tiangang/ ~/.zcode/skills/tiangang/
+# 方式三：远程安装（GitHub 仓库）
+npx skills add Kirky-X/tiangang --agent claude-code -y
 ```
 
 首跑依赖：仅需 Python 3.8+（脚本层标准库）。扫描器本体（Semgrep/Bandit/Trivy 等）由 `scripts/install_tools.sh` 首次运行时按需安装；OCR 需 `npm install -g @alibaba-group/open-code-review` 并配置 LLM API 密钥（`AGNES_TOKEN` 或 `OCR_LLM_TOKEN`）。
