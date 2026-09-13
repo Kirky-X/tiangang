@@ -79,7 +79,12 @@ AGENTS=(
 ALL_AGENT_NAMES=(claude cursor windsurf trae gemini copilot opencode roocode qoder)
 
 # 排除项（相对 skill 源目录的顶层条目）
-EXCLUDE_PATTERNS=(.git .venv node_modules __pycache__ temp .gitnexus .claude)
+# 除通用构建产物外，还排除开发期混入 skill 源目录的非 skill 资产：
+# vendored 上游仓库（open-code-review）、规格工作流目录（specmark）、
+# 分析草稿（.analysis）、测试与覆盖率数据、编辑器配置——这些不属于
+# 分发给目标项目的 skill 内容。
+EXCLUDE_PATTERNS=(.git .venv node_modules __pycache__ temp .gitnexus .claude \
+  open-code-review specmark .analysis tests .coverage .gitignore)
 
 # ---------- 用法 ----------
 usage() {

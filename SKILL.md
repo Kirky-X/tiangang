@@ -1,6 +1,6 @@
 ---
 name: tiangang
-description: "专业 SAST 安全审查工具集，运行 Semgrep/CodeQL/各语言专属扫描器产出统一报告，可选叠加 AI 代码审查（OCR）。触发词：安全审查/漏洞扫描/SAST/代码安全检查/hardcoded secrets/SQL injection/unsafe eval/buffer overflow/insecure deserialization/发布前安全检查/AI代码审查。"
+description: "专业 SAST 安全审查工具集，运行 Semgrep 与各语言专属扫描器产出统一报告（CodeQL 为可选 opt-in，不进默认流程），可选叠加 AI 代码审查（OCR）。触发词：安全审查/漏洞扫描/SAST/代码安全检查/hardcoded secrets/SQL injection/unsafe eval/buffer overflow/insecure deserialization/发布前安全检查/AI代码审查。边界：代码质量/风格/架构审查与 PR 审查编排（review pr）用 diting，本 skill 只做安全扫描。"
 license: MIT
 ---
 
@@ -89,7 +89,7 @@ python3 scripts/generate_report.py <results-dir> --triage
 
 解析 results 目录中的每个原始工具输出（SARIF、Bandit JSON、Cppcheck XML、cargo-audit JSON、Trivy/Gitleaks/Trufflehog/Retire JSON/JSONL——如果接入新工具，扩展脚本中的 `PARSERS`），汇总成一份 Markdown 报告：按严重程度的汇总表、未运行工具的列表及原因、按严重程度再按文件分组的发现。把这份文件作为交付物呈现给用户——不要把原始工具输出粘到对话里，这一步的全部意义就是把五种工具各自奇奇怪怪的格式变成人类能读的一份东西。
 
-**密钥扫描输出的 secret-on-disk 防护**:gitleaks 的 `Secret`/`Match`、trufflehog 的 `Raw`/`Redacted` 字段携带凭证原文。`generate_report.py` 的 parser 在 message 中只保留 rule id / detector name / verified 标志,**绝不**把凭证原文写入报告 —— `redact.py` 的通用正则脱敏是 defense in depth,parser 层是第一道防线。这是一个 P0 安全要求:安全工具自身的输出不能成为 secret-on-disk 的载体。
+**密钥扫描输出的 secret-on-disk 防护**:gitleaks 的 `Secret`/`Match`、trufflehog 的 `Raw`/`Redacted` 字段携带凭证原文。`generate_report.py` 的 parser 在 message 中只保留 rule id / detector name / verified 标志,**绝不**把凭证原文写入报告 —— `redact.py` 的通用正则脱敏是 defense in depth,parser 层是第一道防线。这是一个 P0 安全要求:安全工具自身的输出不能成为 secret-on-disk 的载体。`run_scan.py` 在扫描流水线收尾时会对 results 目录中的原始 JSON/JSONL 输出做原位脱敏；仍应把 results 目录视为敏感物——不要把它拷进报告、日志或提交到 git，扫描完成后可整目录删除。
 
 ## AI 代码审查（单独触发）
 

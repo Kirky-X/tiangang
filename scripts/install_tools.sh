@@ -78,47 +78,68 @@ check_or_install() {
 
 # install_trivy_with_checksum
 #
-# Downloads the trivy binary and its SHA256 checksum, verifies the binary
-# against the checksum BEFORE installing — prevents a MITM on the download
-# from injecting a malicious binary. The old `curl | sh` pattern would
-# execute arbitrary code if the download was intercepted.
+# Downloads the trivy binary and its SHA256 checksum from a release URL
+# pinned to an exact tag, and verifies the binary against the checksum
+# BEFORE installing — prevents a MITM on the download from injecting a
+# malicious binary. The old `curl | sh` pattern would execute arbitrary
+# code if the download was intercepted; that fallback was removed
+# deliberately — a failed download must fail loudly, never silently
+# degrade into piping an installer script into a shell.
+#
+# Pinned version (not the moving "latest" alias): pairing a latest-release
+# redirect with a hardcoded filename is self-contradictory — the filename
+# stops resolving the moment upstream ships a newer release, so the request
+# 404s forever.
+# NOTE: the previously used v0.58.0 release assets are no longer published
+# upstream; bump TRIVY_VERSION when upgrading (verify the tag still has
+# trivy_<version>_checksums.txt on the GitHub release page first).
+TRIVY_VERSION="0.74.0"
+
 install_trivy_with_checksum() {
   local tmpdir
   tmpdir=$(mktemp -d /tmp/trivy-install.XXXXXX)
   trap "rm -rf '$tmpdir'" RETURN
 
+  # goreleaser asset naming (see the release's checksums.txt): OS is
+  # capitalized ("Linux"/"macOS") and arch is 64bit / ARM64 / ARM (32-bit).
   local arch
   arch=$(uname -m)
   case "$arch" in
     x86_64)  arch="64bit" ;;
-    aarch64) arch="arm64" ;;
-    armv7*)  arch="ARM64" ;;
-    *) echo "unsupported architecture: $arch" >&2; return 1 ;;
+    aarch64) arch="ARM64" ;;
+    armv7*|armv6*) arch="ARM" ;;
+    *) echo "unsupported architecture: $arch — install trivy manually per references/tools.md" >&2; return 1 ;;
   esac
   local os
-  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  case "$(uname -s)" in
+    Linux)  os="Linux" ;;
+    Darwin) os="macOS" ;;
+    *) echo "unsupported OS: $(uname -s) — install trivy manually per references/tools.md" >&2; return 1 ;;
+  esac
+  local base="trivy_${TRIVY_VERSION}_${os}-${arch}"
+  local release_url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
 
-  # Download binary + checksum in parallel
-  if ! curl -sfL -o "$tmpdir/trivy.tar.gz" \
-      "https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.58.0_${os}-${arch}.tar.gz" 2>/dev/null; then
-    # Fallback: try the install script (version-pinned) if the direct binary
-    # download fails (e.g. different release tag format).
-    curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.58.0/contrib/install.sh | sh -s -- -b /usr/local/bin
-    return $?
+  if ! curl -sfL -o "$tmpdir/${base}.tar.gz" "${release_url}/${base}.tar.gz" 2>/dev/null; then
+    echo "FAILED to download ${release_url}/${base}.tar.gz" >&2
+    echo "No pipe-to-shell fallback: install trivy manually per references/tools.md" >&2
+    echo "(e.g. 'apt-get install trivy', 'brew install trivy', or download the release asset yourself)." >&2
+    return 1
   fi
-  if ! curl -sfL -o "$tmpdir/checksum.txt" \
-      "https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.58.0_checksum.txt" 2>/dev/null; then
-    echo "could not download checksum file — refusing to install without verification" >&2
+  if ! curl -sfL -o "$tmpdir/checksums.txt" "${release_url}/trivy_${TRIVY_VERSION}_checksums.txt" 2>/dev/null; then
+    echo "could not download trivy_${TRIVY_VERSION}_checksums.txt — refusing to install without verification" >&2
+    echo "Install trivy manually per references/tools.md." >&2
     return 1
   fi
 
-  # Verify SHA256 before extracting
-  if ! (cd "$tmpdir" && grep "trivy_${os}-${arch}.tar.gz" checksum.txt | sha256sum -c --status 2>/dev/null); then
-    echo "SHA256 verification failed — binary may be tampered" >&2
+  # Verify SHA256 before extracting. The checksum line names the asset as
+  # published, so the download must live under that exact name for
+  # sha256sum -c to find it.
+  if ! (cd "$tmpdir" && grep -F "${base}.tar.gz" checksums.txt | sha256sum -c --status 2>/dev/null); then
+    echo "SHA256 verification failed — binary may be tampered; not installing" >&2
     return 1
   fi
 
-  tar -xzf "$tmpdir/trivy.tar.gz" -C "$tmpdir"
+  tar -xzf "$tmpdir/${base}.tar.gz" -C "$tmpdir"
   if [[ -w /usr/local/bin ]]; then
     mv "$tmpdir/trivy" /usr/local/bin/trivy
   else
@@ -134,9 +155,15 @@ check_or_install "semgrep" \
 
 # defusedxml — preferred XML parser for generate_report.py (XXE-safe).
 # Install alongside semgrep so the report generator uses it by default.
+# Install channel must match the check channel: generate_report.py imports
+# defusedxml with `python3 -c "import defusedxml"`, so it must be installed
+# into python3's module search path (`pip install --user`), NOT as a uv tool
+# (uv tool install puts it in an isolated venv the python3 check never sees,
+# which made this step reinstall on every run and left the report generator
+# on the stdlib fallback).
 check_or_install "defusedxml" \
   --check python3 -c "import defusedxml" \
-  --install uv tool install defusedxml
+  --install python3 -m pip install --user defusedxml
 
 # Universal SCA + secret channel (absorbed from strix's source-aware SAST
 # playbook). These run on every scan regardless of detected language —

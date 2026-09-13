@@ -108,8 +108,14 @@ _SECRET_PATTERNS: List[Tuple[re.Pattern, object]] = [
         ),
         lambda m: m.group(0).replace(m.group(2), REDACTED),
     ),
-    # --- Heroku API keys ---
-    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), REDACTED),
+    # NOTE: no bare-UUID pattern. A previous revision redacted every
+    # `[0-9a-f]{8}-...-[0-9a-f]{12}` string to catch Heroku API keys (which
+    # are bare UUIDs), but a UUID is also the shape of correlation ids,
+    # request ids, and trace ids — the pattern redacted ordinary identifiers
+    # everywhere it ran. Heroku credentials arriving via the structured
+    # scanner channels are covered by schema-level redaction (run_scan's
+    # _SECRET_BY_SCHEMA_FIELDS) instead; the regex fallback layer only
+    # redacts what it can distinguish (prefixes, labels, PEM blocks).
     # --- PEM private key blocks (multi-line, any key type) ---
     (
         re.compile(
@@ -126,7 +132,7 @@ _SECRET_PATTERNS: List[Tuple[re.Pattern, object]] = [
     # booleans or short config strings.
     (
         re.compile(
-            r"""(?i)(password|passwd|pwd|secret|api[_\-]?key|access[_\-]?key|"""
+            r"""(?i)(password|passwd|pwd|secret[_\-]?key|secret|api[_\-]?key|access[_\-]?key|"""
             r"""auth[_\-]?token|access[_\-]?token|private[_\-]?key|"""
             r"""client[_\-]?secret|bearer)\s*[:=]\s*"""
             r"""['"]([^\s'"]{12,})['"]"""

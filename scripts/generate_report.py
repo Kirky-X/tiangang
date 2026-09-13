@@ -1205,7 +1205,10 @@ def main():
 
     # Generate triage prompt if --triage requested.
     if args.triage and findings:
-        prompt = generate_triage_prompt(findings)
+        # Pass the scan target so each finding's prompt entry can carry a
+        # secret-redacted code snippet — reachability is not judgeable from
+        # metadata alone (see generate_triage_prompt).
+        prompt = generate_triage_prompt(findings, context=manifest.get("target"))
         triage_path = args.out and args.out.replace(".md", ".triage.txt") or os.path.join(results_dir, "triage_prompt.txt")
         with open(triage_path, "w") as f:
             f.write(prompt)
@@ -1235,6 +1238,72 @@ def main():
             print(f"JSON report written to {out_path} ({len(findings)} findings)")
 
 
+def _resolve_finding_path(file_ref, target_root):
+    """Resolve a finding's file reference against the scan target root.
+
+    Tools report paths in different dialects: absolute (bandit/semgrep run
+    against an absolute target), target-root-relative (gitleaks ``File``), or
+    already-redacted stand-ins. Returns an existing, readable file path
+    strictly inside ``target_root`` (no ``..`` escapes), or None.
+    """
+    if not file_ref or not target_root or not os.path.isdir(target_root):
+        return None
+    target_root = os.path.abspath(target_root)
+    candidates = []
+    if os.path.isabs(file_ref):
+        candidates.append(file_ref)
+    else:
+        candidates.append(os.path.join(target_root, file_ref))
+    for cand in candidates:
+        resolved = os.path.abspath(cand)
+        # Containment: never read snippets from outside the scanned target.
+        if resolved != target_root and not resolved.startswith(target_root + os.sep):
+            return None
+        if os.path.isfile(resolved):
+            return resolved
+    return None
+
+
+def _extract_code_snippet(file_ref, line_no, target_root, max_lines=30):
+    """Extract a secret-redacted code window around a finding location.
+
+    Returns (text, actual_first_line, actual_last_line) or (None, 0, 0) when
+    no snippet can be read. Lines are run through ``redact_secrets`` — the
+    triage prompt is written to disk like every other report artifact, so it
+    must satisfy the same no-secret-on-disk requirement.
+    """
+    path = _resolve_finding_path(file_ref, target_root)
+    if path is None:
+        return None, 0, 0
+    try:
+        with open(path, errors="replace") as f:
+            all_lines = f.readlines()
+    except OSError:
+        return None, 0, 0
+    if not all_lines:
+        return None, 0, 0
+    try:
+        line = int(str(line_no))
+    except (TypeError, ValueError):
+        line = 1
+    line = max(1, min(line, len(all_lines)))
+    half = max_lines // 2
+    start = max(1, line - half)
+    end = min(len(all_lines), start + max_lines - 1)
+    start = max(1, end - max_lines + 1)  # keep the window full-sized near EOF
+    snippet = []
+    for n in range(start, end + 1):
+        text = all_lines[n - 1].rstrip("\n")
+        snippet.append(f"{n:>5} | {redact_secrets(text)}")
+    return "\n".join(snippet), start, end
+
+
+# Upper bound on findings that get a code snippet in one triage prompt —
+# 30 lines each keeps a 100-finding prompt at a sane size; beyond that the
+# LLM gets metadata-only entries (see generate_triage_prompt).
+MAX_TRIAGE_SNIPPETS = 100
+
+
 def generate_triage_prompt(findings, context=None):
     """Generate an LLM prompt for triaging findings as true/false positives.
 
@@ -1246,7 +1315,16 @@ def generate_triage_prompt(findings, context=None):
     This is a deterministic prompt generator — the LLM itself does the
     classification. The prompt is structured so the LLM's response can be
     parsed programmatically.
+
+    ``context`` is the scan target directory (``scan_manifest.json``'s
+    ``target``). When available, each finding's prompt entry carries a
+    secret-redacted code snippet (up to 30 lines around the location) so the
+    LLM can actually judge reachability instead of guessing from metadata.
+    Findings whose snippet is unavailable are explicitly marked
+    metadata-only, and the prompt instructs the model to lower confidence
+    accordingly.
     """
+    has_snippets_capable = bool(context)
     lines = [
         "You are a security analyst triaging SAST findings. For each finding below,",
         "assess whether it is likely a TRUE POSITIVE or FALSE POSITIVE.",
@@ -1256,12 +1334,17 @@ def generate_triage_prompt(findings, context=None):
         "- Is there existing sanitization/validation?",
         "- Is this a test file or dead code?",
         "- Findings confirmed by multiple tools are more likely true positives.",
+        "- Findings that include a code context snippet (secret-redacted, up to 30",
+        "  lines around the reported location) can be judged against the actual",
+        "  source. Findings marked 'no code context' must get only a PRELIMINARY",
+        "  assessment based on the metadata, with confidence lowered accordingly.",
         "",
         "Respond with a JSON array of objects:",
         '[{"index": 0, "verdict": "true_positive|false_positive", "confidence": "high|medium|low", "reasoning": "..."}]',
         "",
         "Findings:",
     ]
+    snippets_shown = 0
     for i, f in enumerate(findings):
         confirmed = f.get("confirmed_by", [])
         confirmed_note = f" (confirmed by: {', '.join(confirmed)})" if confirmed else ""
@@ -1272,7 +1355,27 @@ def generate_triage_prompt(findings, context=None):
         lines.append(f"   Message: {f.get('message', '')}")
         if f.get("fix"):
             lines.append(f"   Suggested fix: {f['fix']}")
+        snippet = None
+        if context is not None and snippets_shown < MAX_TRIAGE_SNIPPETS:
+            snippet, start, end = _extract_code_snippet(
+                f.get("file"), f.get("line"), context
+            )
+            if snippet is not None:
+                snippets_shown += 1
+                lines.append(f"   Code context ({f.get('file')}:{start}-{end}, secret-redacted):")
+                for ln in snippet.splitlines():
+                    lines.append(f"   {ln}")
+        if snippet is None:
+            lines.append(
+                "   Code context: none available — preliminary assessment from "
+                "metadata only, confidence must be low."
+            )
         lines.append("")
+    if has_snippets_capable:
+        lines.append(
+            f"Note: {snippets_shown} of {len(findings)} findings include code context; "
+            "treat the rest as metadata-only."
+        )
     return "\n".join(lines)
 
 
