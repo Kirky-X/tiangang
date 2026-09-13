@@ -1,214 +1,101 @@
-# Tiangang (天罡) — SAST Static Application Security Testing Suite
+# Tiangang — SAST Static Application Security Testing Suite
 
-[中文](README.md) | English
+> A professional SAST suite for AI agents: auto-detects languages, orchestrates Semgrep + language-specific scanners + ecosystem-wide SCA/secret dual channels, and produces one unified human-readable report. **Run the tools, read their output, explain it** — never fake a security review by eyeballing code.
 
-[![GitHub Release](https://img.shields.io/github/v/release/Kirky-X/tiangang?style=flat-square)](https://github.com/Kirky-X/tiangang/releases) [![GitHub License](https://img.shields.io/github/license/Kirky-X/tiangang?style=flat-square)](LICENSE)
+[![version](https://img.shields.io/github/v/tag/Kirky-X/tiangang?style=flat-square)](https://github.com/Kirky-X/tiangang/tags) [![license](https://img.shields.io/github/license/Kirky-X/tiangang?style=flat-square)](LICENSE) [![python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)](scripts/)
 
-Tiangang is an AI-agent-oriented SAST (static application security testing) skill in agent-first format (YAML frontmatter + Markdown workflow notes). It builds a complete pipeline out of four scripts: `detect_languages` auto-identifies the target directory's languages, `install_tools` checks and fills in any missing scanners, `run_scan` runs Semgrep (language-agnostic, always on) plus per-language scanners, and `generate_report` unifies heterogeneous formats (SARIF/JSON/XML) into one human-readable Markdown report.
+English | [中文](README.md)
 
-**Core philosophy**: Every language has a purpose-built tool for a reason — Bandit knows Python's `pickle`/`eval` footguns, Gosec knows Go's specific SQL-injection patterns, and so on. Trying to replicate that coverage by reading code manually misses things these tools catch automatically. **Use the tools; read their output; explain it** — don't eyeball files and call it SAST.
+## ✨ Features
 
-The four steps map to four scripts under `scripts/`, each one's output feeding the next. Full workflow and routing table are in [SKILL.md](SKILL.md).
+- **Four-step workflow** (four scripts in `scripts/`, each step feeding the next): `detect_languages` → `install_tools` → `run_scan` → `generate_report`
+- **General SAST**: Semgrep (language-agnostic, always runs, catches hardcoded secrets and other cross-language patterns); CodeQL (deep scan, opt-in, not in the default flow — see `references/codeql.md`)
+- **SCA + secret dual channels** (run regardless of detected languages): Trivy for ecosystem-wide dependency CVEs (install chain pinned to v0.74.0 with SHA256 checksum verification; DB staleness is materialized into `trivy-version.json` so zero results are no longer misread as "safe"); Gitleaks + Trufflehog as an independent secret-scanning dual channel decoupled from Semgrep `p/secrets` — the parser layer keeps only rule id/detector name, credential raw text never reaches disk or reports (`redact.py` is defense in depth)
+- **10 language-specific scanner groups**: Python→Bandit; Java→FindSecBugs; Go→Gosec; C/C++→Flawfinder+Cppcheck; Ruby→Brakeman; PHP→Psalm; .NET→Security Code Scan; Rust→cargo-audit+Miri; JS/TS→njsscan+retire.js+eslint-plugin-security; IaC→checkov+tfsec
+- **AI code review (OCR, separately triggered)**: `--ocr` whole-file audit / `--ocr-delegate` git diff review, run independently after SAST to catch logic bugs, performance and maintainability concerns
+- **Agent codebase anti-pattern rules**: `--agent-rules` loads `rules/agent-antipatterns.yml`, turning 12-factor-agents architecture violations (framework black-box instantiation, missing intent dispatch, graph orchestration without explicit loops, etc.) into SAST signals
+- **Engineering features**: `--ci` mode (exit code reflects severity + GitHub Actions annotations), `--gate` threshold, `--diff-only` incremental scan (hash cache), `--format md|html|json`, `--trend` comparison, `--triage` LLM false-positive filtering prompts, three-layer finding deduplication with multi-tool confirmation marks
+- **Explicit failure**: missing/failed/skipped tools are annotated with reasons in the report; a clean scan reflects tool coverage only and is never presented as "the code is secure"
 
-## Features
-
-- **10 language-specific scanners** — purpose-built tools per language, not generic rules:
-  - Python → **Bandit**
-  - Java → **FindSecBugs** (Maven/Gradle integration)
-  - Go → **Gosec**
-  - C/C++ → **Flawfinder** + **Cppcheck**
-  - Ruby → **Brakeman** (Rails-specific)
-  - PHP → **Psalm** (composer integration)
-  - .NET → **Security Code Scan** (Roslyn analyzer)
-  - Rust → **cargo-audit** + **Miri**
-  - JavaScript/TypeScript → **njsscan** + **retire.js** + **eslint-plugin-security**
-- **Universal SCA + secret scanning channel** — runs on every scan regardless of detected language (absorbed from strix's source-aware SAST playbook):
-  - **Trivy** — full-ecosystem dependency CVE scan (npm/pip/go/cargo/maven); DB staleness signal materialized to `trivy-version.json`, so a zero-result scan no longer masquerades as "secure" when the DB is stale
-  - **Gitleaks** + **Trufflehog** — independent dual-channel secret scanning, decoupled from Semgrep's `p/secrets` ruleset (single channel = single point of failure); parsers strip `Secret`/`Match`/`Raw`/`Redacted` from finding messages so credentials never land on disk in the report
-- **2 universal SAST scanners** — language-agnostic, covering cross-language patterns:
-  - **Semgrep** — always runs; catches hardcoded secrets, unsafe deserialization, etc.
-  - **CodeQL** — optional deep pass; needs a compiled query database, see `references/codeql.md`
-- **4-step workflow** — Detect → Install → Scan → Report, each step's output feeds the next
-- **Multi-language project support** — auto-discovers all languages (e.g. Python backend + Go sidecar) and scans all of them, not just the dominant one
-- **Unified report** — heterogeneous outputs from many tools (SARIF/JSON/XML/JSONL) merged into one Markdown report grouped by severity
-- **CI/CD native integration** — `--ci` mode outputs GitHub Actions annotations, `--gate` threshold controls blocking severity
-- **Incremental scanning** — `--diff-only` scans only git-changed files, file hash cache avoids redundant scans
-- **Multi-format report output** — `--format md|html|json|all` supports Markdown, HTML, and JSON report formats
-- **Cross-tool finding correlation** — three-tier dedup (exact + CWE same-location + proximity) + multi-tool confirmation tags
-- **Enhanced secret detection** — new patterns for Alibaba Cloud/Tencent Cloud/OpenAI/DB connection strings + Shannon entropy fallback
-- **LLM false positive filtering** — `--triage` generates LLM classification prompt for triage assessment
-- **Scan trend tracking** — `--trend` shows comparison with historical scans, revealing trends
-- **Plugin architecture** — `ToolPlugin` base class for extending with new scanners without modifying core dispatch
-- **Fail loud** — missing tools, install failures, and skipped scans are explicitly noted with reasons in the report, not silently "successful"
-- **Clean scan ≠ secure** — the report explicitly distinguishes "what was actually checked" from "guarantee of no vulnerabilities" to avoid misleading users
-
-## Installation
-
-### Option 1: Install via the `skills` package (recommended)
-
-Requires [Node.js](https://nodejs.org/) 18+ and the `skills` npm package (v1.5.12+). `skills` is the CLI of the open agent skills ecosystem, supporting 68+ agents (Claude Code / Trae / Cursor / Codex / OpenCode, etc.).
+## 📦 Installation
 
 ```bash
-# Install into Claude Code
-npx skills add https://github.com/Kirky-X/tiangang.git --agent claude-code -y
+# Option 1: one-command deploy from this repository root
+# (syncs to ~/.zcode/skills/ and ~/.claude/skills/, LF-normalized)
+bash scripts/sync-skills.sh tiangang
 
-# Equivalent shorthand (owner/repo)
-npx skills add Kirky-X/tiangang --agent claude-code -y
-
-# Install into Trae
-npx skills add Kirky-X/tiangang --agent trae -y
-
-# List all discoverable skills in the repo (without installing)
-npx skills add https://github.com/Kirky-X/tiangang.git --list
+# Option 2: manual copy into an agent skills directory
+cp -r tiangang/ ~/.zcode/skills/tiangang/
 ```
 
-After installation, skill files live in the agent's skills directory (e.g. `.claude/skills/tiangang/`).
+First-run requirements: Python 3.8+ only (scripts use the standard library). The scanners themselves (Semgrep/Bandit/Trivy, etc.) are installed on demand by `scripts/install_tools.sh` on first run; OCR needs `npm install -g @alibaba-group/open-code-review` plus an LLM API key (`AGNES_TOKEN` or `OCR_LLM_TOKEN`).
 
-### Option 2: Traditional git clone
+## 🚀 Quick Start
+
+Prerequisite: the skill is deployed; run the four steps against the target directory (`{SKILL_DIR}` is the install directory).
 
 ```bash
-git clone https://github.com/Kirky-X/tiangang.git
-# Link or copy SKILL.md + references/ + scripts/ into the agent skills directory
-# Example paths per runtime (pick one):
-#   Claude Code:  ~/.claude/skills/tiangang/
-#   Trae:         ~/.trae-cn/skills/tiangang/
-#   Cursor:       ~/.cursor/skills/tiangang/
-#   Codex:        ~/.codex/skills/tiangang/
+# 1. Detect languages (skip if the user already stated them; pass --langs instead)
+python3 {SKILL_DIR}/scripts/detect_languages.py <target-dir> --json
+
+# 2. Install missing tools (command -v pre-check, safe to re-run)
+bash {SKILL_DIR}/scripts/install_tools.sh python go    # or: all
+
+# 3. Run the scan (Semgrep always + SCA/secret channels + language-specific tools)
+python3 {SKILL_DIR}/scripts/run_scan.py <target-dir> --out results
+#    CI gate: --ci --gate high; incremental: --diff-only --since HEAD~1; agent repos: --agent-rules
+
+# 4. Generate the unified report (md|html|json|all)
+python3 {SKILL_DIR}/scripts/generate_report.py results --out report.md
+#    Trends: --trend; LLM triage prompts: --triage
 ```
 
-## Usage examples
+Natural-language triggers (in a skills-aware agent session): "security audit this project", "scan for hardcoded secrets", "pre-release security check", "SAST on this agent codebase".
 
-Once loaded as a skill, Tiangang is triggered by natural-language intent — no explicit commands needed. Typical triggers:
+## ✅ Tests & Verification
 
-| User intent | Trigger keywords |
-| ----------- | ----------------- |
-| Security audit / review | "security audit", "安全审查", "安全审计" |
-| Vulnerability scan | "vulnerability scan", "漏洞扫描", "check for vulnerabilities" |
-| SAST scan | "SAST scan", "静态安全扫描" |
-| Pre-release check | "release check", "pre-deploy security check", "上线前扫描" |
-| Specific issue hunt | "hardcoded secrets", "SQL injection", "unsafe eval", "deserialization", "buffer overflow" |
-| Language tool query | "which security tools apply to my project's language" |
+Measured pytest run (2026-09-13, Python 3.12):
 
-### Four-step workflow
-
-```bash
-# 1. Detect languages (can be skipped by passing --langs to the next step)
-python3 scripts/detect_languages.py <target-dir> --json
-
-# 2. Install missing tools (idempotent — only installs what's missing)
-bash scripts/install_tools.sh <lang1> <lang2> ...
-# Or install every supported tool at once:
-bash scripts/install_tools.sh all
-
-# 3. Run the scan (Semgrep always on + per-language tools)
-python3 scripts/run_scan.py <target-dir> [--out <results-dir>] [--langs python,go,...]
-# CI mode: exit code reflects finding severity, outputs GitHub Actions annotations
-python3 scripts/run_scan.py <target-dir> --ci --gate high
-# Incremental mode: only scan files changed since a git ref
-python3 scripts/run_scan.py <target-dir> --diff-only --since HEAD~1
-
-# 4. Generate the unified report (multiple formats supported)
-python3 scripts/generate_report.py <results-dir> [--out report.md] [--format md|html|json|all]
-# Include trend comparison with previous scans
-python3 scripts/generate_report.py <results-dir> --trend
-# Generate LLM triage prompt for false positive assessment
-python3 scripts/generate_report.py <results-dir> --triage
+```text
+$ python3 -m pytest tests -q
+.......................................................................  [100%]
+503 passed in 11.13s
 ```
 
-### Typical scenarios
+Eleven test files covering: language-detection coverage, report generation, run_scan orchestration, SARIF output, redaction, OCR integration, secret dual-channel absorption (strix absorption), fix regressions, and optimization items.
 
-**Quick scan of a single-language project**:
+Smoke tests: `detect_languages.py` correctly returns `{"languages": ["python"]}` on a sample directory containing `requirements.txt`; the Trivy installer in `install_tools.sh` verifies the downloaded binary's SHA256 checksum (`TRIVY_VERSION="0.74.0"`).
 
-> "Scan this Python project for security issues."
+## 📁 Directory Structure
 
-Agent routes → detects language → installs Bandit/Semgrep → runs scan → produces unified report → proactively explains Critical/High findings' vulnerability patterns (e.g. SQL injection, pickle deserialization, eval misuse).
-
-**Multi-language project + CodeQL deep scan**:
-
-> "Do a thorough security audit of /path/to/repo, including a CodeQL deep scan."
-
-Agent recognizes multi-step task → auto-discovers multiple languages → installs Bandit/Gosec/Semgrep in parallel → runs scan → reads `references/codeql.md` for the separate CodeQL flow (database build → security query suite) → merges all SARIF/JSON → notes CodeQL coverage and reasons for any tools that didn't run.
-
-## Capability overview
-
-### `references/` — Tool tables and deep flows
-
-| File                              | Contents                                                                |
-| --------------------------------- | ------------------------------------------------------------------- |
-| [`tools.md`](references/tools.md) | Full per-language tool table: tool name, detection signal, install command, scan command, output format |
-| [`codeql.md`](references/codeql.md) | Separate, heavier CodeQL flow: CLI setup, database creation, running the security query suite (read only when doing a deep/opt-in scan) |
-
-### `scripts/` — Four-step workflow
-
-| Script                                                            | Step                                                  |
-| ----------------------------------------------------------------- | ----------------------------------------------------- |
-| [`detect_languages.py`](scripts/detect_languages.py)              | Step 1: walk the target dir, identify languages via manifest files + extension counts |
-| [`install_tools.sh`](scripts/install_tools.sh)                    | Step 2: `command -v` check, only install what's missing; safe to re-run |
-| [`run_scan.py`](scripts/run_scan.py)                              | Step 3: run Semgrep (always) + per-language scanners; write SARIF/JSON |
-| [`generate_report.py`](scripts/generate_report.py)                | Step 4: parse all raw outputs into a unified Markdown report grouped by severity |
-
-### `test-prompts.json` — 4 validation cases
-
-Covers a typical single-language case, a multi-language + deep-scan case, a fail-loud case for missing tools, and an anti-misleading "clean scan ≠ secure" case.
-
-## Full pipeline
-
-```mermaid
-flowchart TD
-  A["detect_languages<br/>detect langs"] --> B["install_tools<br/>fill tools"]
-  B --> C["run_scan<br/>run scan"]
-  C --> D["generate_report<br/>unified report"]
-  E["(optional) CodeQL deep scan"] --> F["SARIF"]
-  F -.->|merged into same results dir| D
+```text
+tiangang/
+├── SKILL.md                 # Entry: four-step workflow + OCR triggers + report-reading discipline
+├── skill.json               # Metadata (v0.2.1, MIT)
+├── references/
+│   ├── tools.md             # Full language tool table: detection signals/install/scan commands/output formats
+│   ├── codeql.md            # Standalone CodeQL deep-scan workflow (read only when opted in)
+│   └── agent-semgrep-rules.md  # agent anti-pattern rule-set docs
+├── rules/
+│   └── agent-antipatterns.yml  # materialized Semgrep agent anti-pattern rules
+├── scripts/
+│   ├── detect_languages.py  # Step 1: manifest strong signals + extension-count weak signals
+│   ├── install_tools.sh     # Step 2: installs only missing tools; Trivy pinned v0.74.0 + checksum
+│   ├── run_scan.py          # Step 3: plugin-based orchestration (ToolPlugin), --ci/--gate/--diff-only/--ocr
+│   ├── generate_report.py   # Step 4: multi-format parsing → unified report (--trend/--triage)
+│   ├── sarif_report.py      # SARIF aggregation
+│   └── redact.py            # generic regex redaction (defense in depth)
+├── open-code-review/        # OCR integration reference
+└── tests/                   # pytest suite (503 cases, 11 files)
 ```
 
-1. `detect_languages` returns every language above the noise threshold using manifest files (`requirements.txt`, `go.mod`, `Cargo.toml`, etc. — a strong signal) plus extension counts (a weaker signal, filtered by a minimum file count so a single stray script doesn't pull in an irrelevant tool)
-2. `install_tools` checks each relevant tool and installs only what's missing; for tools that can't be auto-installed (FindSecBugs / Security Code Scan / Psalm) it prints what to do rather than silently skipping
-3. `run_scan` always runs Semgrep (language-agnostic, catches cross-language patterns like hardcoded secrets) + the universal SCA/secret channel (trivy/gitleaks/trufflehog, runs regardless of detected language) + the language-specific tools available from step 2; writes each tool's raw output and a `scan_manifest.json` recording what ran and what was skipped
-4. `generate_report` parses heterogeneous formats (SARIF / Bandit JSON / Cppcheck XML / cargo-audit JSON / Trivy JSON / Gitleaks JSON / Trufflehog JSONL / Retire JSON — extend `PARSERS` in the script if you wire in a new tool) into one Markdown: a summary table by severity, a list of any tools that didn't run and why, and findings grouped by severity then by file. Secret-channel parsers keep only rule id / detector name in finding messages — credential values (`Secret`/`Match`/`Raw`/`Redacted`) never enter the report; `redact.py` is defense in depth
+## 🔮 Boundaries
 
-## FAQ
+- **Code quality/style/architecture review and PR review orchestration (`review pr`) belong to [diting](../diting/)**: this skill only does security scanning, not general code review
+- **OCR never auto-triggers**: it runs as a standalone step after SAST only when the user explicitly asks for AI code review
+- **CodeQL stays out of the default flow**: it requires building a query database and is markedly slower — run the standalone `references/codeql.md` flow only when the user asks for a "deep" audit or names CodeQL
+- **A clean scan ≠ secure**: the report states the actual coverage (which tools, which languages) and honestly marks coverage gaps
 
-### Which tools can't be auto-installed?
+## 📄 License & Attribution
 
-Three tools need project-specific wiring rather than a standalone CLI; `install_tools.sh` prints what to do rather than silently skipping:
-
-- **FindSecBugs** (Java) — needs to be added to the project's Maven/Gradle build, or run against already-compiled `.class` files
-- **Security Code Scan** (.NET) — is a Roslyn analyzer added via `dotnet add package`
-- **Psalm** (PHP) — needs an existing `composer.json` to hook into
-
-When these come up, the agent should offer to make the build-file edit for the user rather than leaving it as a manual step they have to come back to.
-
-### Why isn't CodeQL part of the `run_scan` step?
-
-CodeQL needs a compiled query database built first and is noticeably slower — treat it as an opt-in deep pass. When the user asks for a "deep" or "thorough" audit, or names CodeQL specifically, read `references/codeql.md` and run that flow separately, writing its SARIF output into the same results directory before generating the report.
-
-### Does a clean scan mean the code is secure?
-
-**No.** The report explicitly distinguishes "what was actually checked" from "guarantee of no vulnerabilities": it lists the tools that ran, the languages and vulnerability types they covered, and the coverage gaps from tools that couldn't be installed or didn't run. A clean scan reflects the coverage of those tools, not a guarantee of no vulnerabilities. CodeQL deep scan can be added to strengthen coverage.
-
-### `skills add` reports "Installation complete" but `.claude/skills/tiangang/` doesn't exist?
-
-This is a known issue with the `skills` package: the command reports success but doesn't actually copy files. **Workaround**: manually copy the skill files into the agent skills directory:
-
-```bash
-# Claude Code
-mkdir -p ~/.claude/skills/tiangang
-cp -r SKILL.md skill.json references scripts ~/.claude/skills/tiangang/
-
-# Trae
-mkdir -p ~/.trae-cn/skills/tiangang
-cp -r SKILL.md skill.json references scripts ~/.trae-cn/skills/tiangang/
-
-# Cursor
-mkdir -p ~/.cursor/skills/tiangang
-cp -r SKILL.md skill.json references scripts ~/.cursor/skills/tiangang/
-
-# Codex
-mkdir -p ~/.codex/skills/tiangang
-cp -r SKILL.md skill.json references scripts ~/.codex/skills/tiangang/
-```
-
-## License
-
-MIT
+MIT License (© 2026 Kirky-X). The SCA/secret channel design absorbs a source-aware SAST playbook (strix); the OCR layer is based on the open-source project [open-code-review](https://github.com/alibaba/open-code-review) (`@alibaba-group/open-code-review`), snapshotted in `open-code-review/`.
