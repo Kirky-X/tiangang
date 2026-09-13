@@ -171,7 +171,9 @@ def _build_rules(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
-def to_sarif(findings: List[Dict[str, Any]], manifest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def to_sarif(
+    findings: List[Dict[str, Any]], manifest: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """Aggregate normalized findings into a SARIF 2.1.0 document.
 
     Findings without a usable file location are skipped (SARIF requires a
@@ -194,7 +196,9 @@ def to_sarif(findings: List[Dict[str, Any]], manifest: Optional[Dict[str, Any]] 
         "id": {"text": "tiangang-aggregated-scan"},
     }
     if manifest:
-        automation["id"]["text"] = f"tiangang-{manifest.get('timestamp', '')[:19].replace(':', '-')}"
+        automation["id"]["text"] = (
+            f"tiangang-{manifest.get('timestamp', '')[:19].replace(':', '-')}"
+        )
         if manifest.get("target"):
             automation["logicalLocations"] = [
                 {"fullyQualifiedName": manifest["target"], "kind": "namespace"}

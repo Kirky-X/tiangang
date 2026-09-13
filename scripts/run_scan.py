@@ -37,6 +37,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+# B3: reuse SKIP_DIRS from detect_languages (single source of truth for skip sets)
+from detect_languages import SKIP_DIRS
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # redact.py lives next to this script. Importing it means the secret
@@ -58,7 +61,7 @@ SUPPORTED_LANGS = {
     "dotnet",
     "rust",
     "javascript",  # JS + TS share scanner set (njsscan + eslint-plugin-security)
-    "iac",         # IaC: Terraform/Kubernetes/Docker (checkov + tfsec)
+    "iac",  # IaC: Terraform/Kubernetes/Docker (checkov + tfsec)
 }
 
 # Default upper bound on concurrent scanners. Each scanner is an I/O-bound
@@ -126,6 +129,7 @@ class ToolPlugin:
                 cmd = ["my-scanner", "--json", "-o", out_file, target]
                 return lambda: run_tool(self.name, cmd, out_file)
     """
+
     name: str = ""
     languages: set = set()
 
@@ -165,11 +169,6 @@ SEMGREP_JOBS = 4
 SEMGREP_TIMEOUT = 20  # seconds, per file
 
 
-# B3: reuse SKIP_DIRS from detect_languages to avoid two divergent skip sets
-# (the old _has_ruby_code inline tuple missed __pycache__/venv/.venv/.tox/bin/obj).
-from detect_languages import SKIP_DIRS
-
-
 def sh(cmd, cwd=None, timeout=600):
     """Run a command (list form), returning (returncode, combined_output). Never raises.
 
@@ -207,13 +206,23 @@ def detect_languages(target, max_depth=0):
         manifest_matches: list of strong-signal languages
         has_gemfile: bool — whether a Gemfile was found (for brakeman pre-check)
     """
-    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "detect_languages.py"), target, "--json"]
+    cmd = [
+        sys.executable,
+        os.path.join(SCRIPT_DIR, "detect_languages.py"),
+        target,
+        "--json",
+    ]
     if max_depth > 0:
         cmd.extend(["--max-depth", str(max_depth)])
     rc, out = sh(cmd)
     if rc != 0:
         print(f"warning: language detection failed (rc={rc}): {out}", file=sys.stderr)
-        return {"languages": [], "ext_counts": {}, "manifest_matches": [], "has_gemfile": False}
+        return {
+            "languages": [],
+            "ext_counts": {},
+            "manifest_matches": [],
+            "has_gemfile": False,
+        }
     try:
         data = json.loads(out)
         # Normalize: ensure all expected keys exist even when the detector
@@ -228,7 +237,12 @@ def detect_languages(target, max_depth=0):
         }
         return result
     except Exception:
-        return {"languages": [], "ext_counts": {}, "manifest_matches": [], "has_gemfile": False}
+        return {
+            "languages": [],
+            "ext_counts": {},
+            "manifest_matches": [],
+            "has_gemfile": False,
+        }
 
 
 def run_tool(
@@ -531,9 +545,8 @@ def _gitleaks_thunk(target, out_dir):
         if r and r[-1]["returncode"] == 1 and os.path.exists(out_path):
             r[-1]["returncode"] = 0
             r[-1]["log_tail"] = (
-                (r[-1].get("log_tail") or "")
-                + "\n[gitleaks rc=1 normalized: secrets found, not a failure]"
-            )
+                r[-1].get("log_tail") or ""
+            ) + "\n[gitleaks rc=1 normalized: secrets found, not a failure]"
         return r
 
     return _run
@@ -642,8 +655,9 @@ def _ocr_detect_project_type(target):
             "5.可维护性: 命名/模块边界/循环依赖\n"
             "6.测试覆盖: 单元测试/mock/边界条件"
         )
-    if (os.path.isfile(os.path.join(target, "requirements.txt"))
-            or os.path.isfile(os.path.join(target, "pyproject.toml"))):
+    if os.path.isfile(os.path.join(target, "requirements.txt")) or os.path.isfile(
+        os.path.join(target, "pyproject.toml")
+    ):
         return (
             "Python项目全维度深度审查。覆盖："
             "安全性/异常处理/类型提示/可变默认参数/性能/测试"
@@ -675,14 +689,18 @@ def _ocr_setup_env():
                 "OCR_LLM_TOKEN=<key> before running with --ocr."
             )
     # Defaults for endpoint configuration (absorbed from ocr_scan.sh).
-    os.environ.setdefault("OCR_LLM_URL", "https://apihub.agnes-ai.com/v1/chat/completions")
+    os.environ.setdefault(
+        "OCR_LLM_URL", "https://apihub.agnes-ai.com/v1/chat/completions"
+    )
     os.environ.setdefault("OCR_LLM_MODEL", "agnes-2.5-flash")
     os.environ.setdefault("OCR_LLM_PROTOCOL", "openai")
     # Connectivity test — fail fast before launching a long scan.
     try:
         proc = subprocess.run(
             ["ocr", "llm", "test"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         combined = (proc.stdout or "") + (proc.stderr or "")
         if "✓" not in combined and proc.returncode != 0:
@@ -706,8 +724,23 @@ def _ocr_find_subdirs(target):
     separately to stay within rate limits, with a delay between batches.
     Returns a list of relative paths (relative to target).
     """
-    src_exts = {".rs", ".go", ".ts", ".tsx", ".js", ".jsx", ".py", ".dart",
-                ".java", ".rb", ".php", ".c", ".cpp", ".h", ".cs"}
+    src_exts = {
+        ".rs",
+        ".go",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".py",
+        ".dart",
+        ".java",
+        ".rb",
+        ".php",
+        ".c",
+        ".cpp",
+        ".h",
+        ".cs",
+    }
     subdirs = []
     try:
         entries = sorted(os.listdir(target))
@@ -740,7 +773,9 @@ def _ocr_extract_session_findings(target, out_dir):
     if not os.path.isdir(session_base):
         return []
     # Try to match by project slug first, fall back to recent sessions.
-    project_slug = re.sub(r"[^a-zA-Z0-9]", "-", os.path.basename(os.path.abspath(target)))
+    project_slug = re.sub(
+        r"[^a-zA-Z0-9]", "-", os.path.basename(os.path.abspath(target))
+    )
     session_dir = None
     try:
         for entry in sorted(os.listdir(session_base), reverse=True):
@@ -773,9 +808,13 @@ def _ocr_extract_session_findings(target, out_dir):
     seen = set()
     try:
         jsonl_files = sorted(
-            [os.path.join(session_dir, f) for f in os.listdir(session_dir)
-             if f.endswith(".jsonl")],
-            key=os.path.getmtime, reverse=True,
+            [
+                os.path.join(session_dir, f)
+                for f in os.listdir(session_dir)
+                if f.endswith(".jsonl")
+            ],
+            key=os.path.getmtime,
+            reverse=True,
         )
     except OSError:
         return []
@@ -797,25 +836,35 @@ def _ocr_extract_session_findings(target, out_dir):
                     if not fp or not args_raw:
                         continue
                     try:
-                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                        args = (
+                            json.loads(args_raw)
+                            if isinstance(args_raw, str)
+                            else args_raw
+                        )
                     except json.JSONDecodeError:
                         continue
-                    for comment in (args.get("comments") or []):
+                    for comment in args.get("comments") or []:
                         content = comment.get("content", "")
                         key = (fp, content[:80])
                         if key in seen:
                             continue
                         seen.add(key)
-                        sev_raw = comment.get("severity", comment.get("level", "unknown"))
+                        sev_raw = comment.get(
+                            "severity", comment.get("level", "unknown")
+                        )
                         cat_raw = comment.get("category", comment.get("rule", "other"))
-                        findings.append({
-                            "path": fp,
-                            "content": content,
-                            "severity": str(sev_raw).lower(),
-                            "category": str(cat_raw).lower(),
-                            "start_line": comment.get("lines", comment.get("line_range", "?")),
-                            "suggestion_code": comment.get("suggestion_code", ""),
-                        })
+                        findings.append(
+                            {
+                                "path": fp,
+                                "content": content,
+                                "severity": str(sev_raw).lower(),
+                                "category": str(cat_raw).lower(),
+                                "start_line": comment.get(
+                                    "lines", comment.get("line_range", "?")
+                                ),
+                                "suggestion_code": comment.get("suggestion_code", ""),
+                            }
+                        )
         except OSError:
             continue
     # Write session findings to ocr-session.json for the parser.
@@ -829,9 +878,16 @@ def _ocr_extract_session_findings(target, out_dir):
     return findings
 
 
-def _ocr_thunk(target, out_dir, ocr_mode="scan",
-               ocr_background="", ocr_delay=5, ocr_retry=2, ocr_timeout=60,
-               diff_files=None):
+def _ocr_thunk(
+    target,
+    out_dir,
+    ocr_mode="scan",
+    ocr_background="",
+    ocr_delay=5,
+    ocr_retry=2,
+    ocr_timeout=60,
+    diff_files=None,
+):
     """OCR (open-code-review) AI-powered code review thunk.
 
     Three modes:
@@ -858,11 +914,14 @@ def _ocr_thunk(target, out_dir, ocr_mode="scan",
         # --- Environment setup ---
         ok, err_msg = _ocr_setup_env()
         if not ok:
-            r.append({
-                "tool": "ocr", "command": "",
-                "returncode": -1,
-                "log_tail": f"[ocr env setup failed] {err_msg}",
-            })
+            r.append(
+                {
+                    "tool": "ocr",
+                    "command": "",
+                    "returncode": -1,
+                    "log_tail": f"[ocr env setup failed] {err_msg}",
+                }
+            )
             return r
 
         # --- Build background string ---
@@ -875,25 +934,43 @@ def _ocr_thunk(target, out_dir, ocr_mode="scan",
         if ocr_mode == "review":
             # Git diff-based review — no batching needed.
             cmd = [
-                "ocr", "review",
-                "--format", "json",
-                "--audience", "agent",
+                "ocr",
+                "review",
+                "--format",
+                "json",
+                "--audience",
+                "agent",
             ]
-            run_tool("ocr", r, cmd, cwd=target, timeout=ocr_timeout * 10,
-                     output_file=out_path)
+            run_tool(
+                "ocr",
+                r,
+                cmd,
+                cwd=target,
+                timeout=ocr_timeout * 10,
+                output_file=out_path,
+            )
             # rc=1 means findings found — normalize to 0 when report exists.
             if r and r[-1]["returncode"] == 1 and os.path.exists(out_path):
                 r[-1]["returncode"] = 0
                 r[-1]["log_tail"] = (
-                    (r[-1].get("log_tail") or "")
-                    + "\n[ocr rc=1 normalized: findings detected, not a failure]"
-                )
+                    r[-1].get("log_tail") or ""
+                ) + "\n[ocr rc=1 normalized: findings detected, not a failure]"
         else:
             # --- Determine scan targets ---
             # If diff_files provided (--diff-only mode), scan only those files.
             # Filter to source files that ocr can review (.rs/.go/.ts/.py/etc).
-            OCR_EXTS = {'.rs', '.go', '.ts', '.tsx', '.js', '.jsx', '.py', '.dart',
-                        '.toml', '.ftl'}
+            OCR_EXTS = {
+                ".rs",
+                ".go",
+                ".ts",
+                ".tsx",
+                ".js",
+                ".jsx",
+                ".py",
+                ".dart",
+                ".toml",
+                ".ftl",
+            }
             if diff_files:
                 # Convert absolute paths to repo-relative for ocr --path
                 changed_rel = []
@@ -911,21 +988,33 @@ def _ocr_thunk(target, out_dir, ocr_mode="scan",
                 failed_files = set()
                 BATCH_SIZE = 10
                 for batch_start in range(0, len(changed_rel), BATCH_SIZE):
-                    batch = changed_rel[batch_start:batch_start + BATCH_SIZE]
+                    batch = changed_rel[batch_start : batch_start + BATCH_SIZE]
                     batch_csv = ",".join(batch)
                     batch_idx = batch_start // BATCH_SIZE
                     batch_out = os.path.join(out_dir, f"ocr_batch_{batch_idx}.json")
                     cmd = [
-                        "ocr", "scan",
-                        "--path", batch_csv,
-                        "--concurrency", "1",
-                        "--background", full_background,
-                        "--format", "json",
-                        "--timeout", str(ocr_timeout),
+                        "ocr",
+                        "scan",
+                        "--path",
+                        batch_csv,
+                        "--concurrency",
+                        "1",
+                        "--background",
+                        full_background,
+                        "--format",
+                        "json",
+                        "--timeout",
+                        str(ocr_timeout),
                     ]
                     batch_ran = []
-                    run_tool("ocr", batch_ran, cmd, cwd=target,
-                             timeout=ocr_timeout * 10, output_file=batch_out)
+                    run_tool(
+                        "ocr",
+                        batch_ran,
+                        cmd,
+                        cwd=target,
+                        timeout=ocr_timeout * 10,
+                        output_file=batch_out,
+                    )
                     r.extend(batch_ran)
                     if os.path.exists(batch_out):
                         try:
@@ -952,16 +1041,28 @@ def _ocr_thunk(target, out_dir, ocr_mode="scan",
                     retry_csv = ",".join(retry_list)
                     retry_out = os.path.join(out_dir, f"ocr_retry_{retry_round}.json")
                     cmd = [
-                        "ocr", "scan",
-                        "--path", retry_csv,
-                        "--concurrency", "1",
-                        "--background", full_background,
-                        "--format", "json",
-                        "--timeout", str(ocr_timeout),
+                        "ocr",
+                        "scan",
+                        "--path",
+                        retry_csv,
+                        "--concurrency",
+                        "1",
+                        "--background",
+                        full_background,
+                        "--format",
+                        "json",
+                        "--timeout",
+                        str(ocr_timeout),
                     ]
                     retry_ran = []
-                    run_tool("ocr", retry_ran, cmd, cwd=target,
-                             timeout=ocr_timeout * 10, output_file=retry_out)
+                    run_tool(
+                        "ocr",
+                        retry_ran,
+                        cmd,
+                        cwd=target,
+                        timeout=ocr_timeout * 10,
+                        output_file=retry_out,
+                    )
                     r.extend(retry_ran)
                     if os.path.exists(retry_out):
                         try:
@@ -988,15 +1089,22 @@ def _ocr_thunk(target, out_dir, ocr_mode="scan",
                 if not subdirs:
                     # No subdirectories — single scan of the whole target.
                     cmd = [
-                        "ocr", "scan",
-                        "--format", "json",
-                        "--concurrency", "1",
-                        "--background", full_background,
-                        "--timeout", str(ocr_timeout),
-                        "--repo", target,
+                        "ocr",
+                        "scan",
+                        "--format",
+                        "json",
+                        "--concurrency",
+                        "1",
+                        "--background",
+                        full_background,
+                        "--timeout",
+                        str(ocr_timeout),
+                        "--repo",
+                        target,
                     ]
-                    run_tool("ocr", r, cmd, timeout=ocr_timeout * 10,
-                             output_file=out_path)
+                    run_tool(
+                        "ocr", r, cmd, timeout=ocr_timeout * 10, output_file=out_path
+                    )
                 else:
                     # Batch by subdirectory with delays between batches.
                     all_findings = []
@@ -1006,16 +1114,28 @@ def _ocr_thunk(target, out_dir, ocr_mode="scan",
                             time.sleep(ocr_delay)
                         batch_out = os.path.join(out_dir, f"ocr_batch_{i}.json")
                         cmd = [
-                            "ocr", "scan",
-                            "--path", subdir,
-                            "--concurrency", "1",
-                            "--background", full_background,
-                            "--format", "json",
-                            "--timeout", str(ocr_timeout),
+                            "ocr",
+                            "scan",
+                            "--path",
+                            subdir,
+                            "--concurrency",
+                            "1",
+                            "--background",
+                            full_background,
+                            "--format",
+                            "json",
+                            "--timeout",
+                            str(ocr_timeout),
                         ]
                         batch_ran = []
-                        run_tool("ocr", batch_ran, cmd, cwd=target,
-                                 timeout=ocr_timeout * 10, output_file=batch_out)
+                        run_tool(
+                            "ocr",
+                            batch_ran,
+                            cmd,
+                            cwd=target,
+                            timeout=ocr_timeout * 10,
+                            output_file=batch_out,
+                        )
                         r.extend(batch_ran)
                         # Collect findings from this batch.
                         if os.path.exists(batch_out):
@@ -1027,7 +1147,9 @@ def _ocr_thunk(target, out_dir, ocr_mode="scan",
                             except (json.JSONDecodeError, OSError):
                                 pass
                         # Track failed files for retry.
-                        log_tail = batch_ran[-1].get("log_tail", "") if batch_ran else ""
+                        log_tail = (
+                            batch_ran[-1].get("log_tail", "") if batch_ran else ""
+                        )
                         for m in re.finditer(r"Scan subtask error for (\S+)", log_tail):
                             failed_files.add(m.group(1))
 
@@ -1039,18 +1161,32 @@ def _ocr_thunk(target, out_dir, ocr_mode="scan",
                         retry_list = sorted(failed_files)
                         failed_files = set()
                         retry_csv = ",".join(retry_list)
-                        retry_out = os.path.join(out_dir, f"ocr_retry_{retry_round}.json")
+                        retry_out = os.path.join(
+                            out_dir, f"ocr_retry_{retry_round}.json"
+                        )
                         cmd = [
-                            "ocr", "scan",
-                            "--path", retry_csv,
-                            "--concurrency", "1",
-                            "--background", full_background,
-                            "--format", "json",
-                            "--timeout", str(ocr_timeout),
+                            "ocr",
+                            "scan",
+                            "--path",
+                            retry_csv,
+                            "--concurrency",
+                            "1",
+                            "--background",
+                            full_background,
+                            "--format",
+                            "json",
+                            "--timeout",
+                            str(ocr_timeout),
                         ]
                         retry_ran = []
-                        run_tool("ocr", retry_ran, cmd, cwd=target,
-                                 timeout=ocr_timeout * 10, output_file=retry_out)
+                        run_tool(
+                            "ocr",
+                            retry_ran,
+                            cmd,
+                            cwd=target,
+                            timeout=ocr_timeout * 10,
+                            output_file=retry_out,
+                        )
                         r.extend(retry_ran)
                         if os.path.exists(retry_out):
                             try:
@@ -1060,7 +1196,9 @@ def _ocr_thunk(target, out_dir, ocr_mode="scan",
                                     all_findings.extend(retry_data)
                             except (json.JSONDecodeError, OSError):
                                 pass
-                        log_tail = retry_ran[-1].get("log_tail", "") if retry_ran else ""
+                        log_tail = (
+                            retry_ran[-1].get("log_tail", "") if retry_ran else ""
+                        )
                         for m in re.finditer(r"Scan subtask error for (\S+)", log_tail):
                             failed_files.add(m.group(1))
 
@@ -1076,9 +1214,8 @@ def _ocr_thunk(target, out_dir, ocr_mode="scan",
             if r and r[-1]["returncode"] == 1 and os.path.exists(out_path):
                 r[-1]["returncode"] = 0
                 r[-1]["log_tail"] = (
-                    (r[-1].get("log_tail") or "")
-                    + "\n[ocr rc=1 normalized: findings detected, not a failure]"
-                )
+                    r[-1].get("log_tail") or ""
+                ) + "\n[ocr rc=1 normalized: findings detected, not a failure]"
 
         # --- Session extraction (enriches report with detailed session data) ---
         _ocr_extract_session_findings(target, out_dir)
@@ -1104,8 +1241,10 @@ def _checkov_thunk(target, out_dir):
             r,
             [
                 "checkov",
-                "--directory", target,
-                "--output", "json",
+                "--directory",
+                target,
+                "--output",
+                "json",
                 "--quiet",
                 "--compact",
             ],
@@ -1116,9 +1255,8 @@ def _checkov_thunk(target, out_dir):
         if r and r[-1]["returncode"] == 1 and os.path.exists(out_path):
             r[-1]["returncode"] = 0
             r[-1]["log_tail"] = (
-                (r[-1].get("log_tail") or "")
-                + "\n[checkov rc=1 normalized: findings detected, not a failure]"
-            )
+                r[-1].get("log_tail") or ""
+            ) + "\n[checkov rc=1 normalized: findings detected, not a failure]"
         return r
 
     return _run
@@ -1141,8 +1279,10 @@ def _tfsec_thunk(target, out_dir):
             [
                 "tfsec",
                 target,
-                "--format", "json",
-                "--out", out_path,
+                "--format",
+                "json",
+                "--out",
+                out_path,
                 "--soft-fail",
             ],
             timeout=600,
@@ -1238,10 +1378,14 @@ def _run_concurrently(tasks, sequential=False):
             try:
                 ran.extend(list(fn()))
             except Exception as e:
-                ran.append({
-                    "tool": name, "command": "", "returncode": -3,
-                    "log_tail": f"[scanner task crashed] {type(e).__name__}: {e}",
-                })
+                ran.append(
+                    {
+                        "tool": name,
+                        "command": "",
+                        "returncode": -3,
+                        "log_tail": f"[scanner task crashed] {type(e).__name__}: {e}",
+                    }
+                )
         return ran
     # Partition tasks into CPU-intensive and I/O-bound groups.
     cpu_tasks = [(n, f) for n, f in tasks if n in _CPU_INTENSIVE_TOOLS]
@@ -1252,33 +1396,45 @@ def _run_concurrently(tasks, sequential=False):
     if cpu_tasks:
         cpu_workers = min(2, len(cpu_tasks))
         with ThreadPoolExecutor(max_workers=cpu_workers) as ex:
-            futures = {ex.submit(fn): task_idx + i for i, (_, fn) in enumerate(cpu_tasks)}
+            futures = {
+                ex.submit(fn): task_idx + i for i, (_, fn) in enumerate(cpu_tasks)
+            }
             for fut in as_completed(futures):
                 idx = futures[fut]
                 name = cpu_tasks[idx - task_idx][0]
                 try:
                     results_by_idx[idx] = list(fut.result())
                 except Exception as e:
-                    results_by_idx[idx] = [{
-                        "tool": name, "command": "", "returncode": -3,
-                        "log_tail": f"[scanner task crashed] {type(e).__name__}: {e}",
-                    }]
+                    results_by_idx[idx] = [
+                        {
+                            "tool": name,
+                            "command": "",
+                            "returncode": -3,
+                            "log_tail": f"[scanner task crashed] {type(e).__name__}: {e}",
+                        }
+                    ]
         task_idx += len(cpu_tasks)
     # Run I/O-bound tools with full parallelism.
     if io_tasks:
         io_workers = min(_max_workers(), len(io_tasks))
         with ThreadPoolExecutor(max_workers=io_workers) as ex:
-            futures = {ex.submit(fn): task_idx + i for i, (_, fn) in enumerate(io_tasks)}
+            futures = {
+                ex.submit(fn): task_idx + i for i, (_, fn) in enumerate(io_tasks)
+            }
             for fut in as_completed(futures):
                 idx = futures[fut]
                 name = io_tasks[idx - task_idx][0]
                 try:
                     results_by_idx[idx] = list(fut.result())
                 except Exception as e:
-                    results_by_idx[idx] = [{
-                        "tool": name, "command": "", "returncode": -3,
-                        "log_tail": f"[scanner task crashed] {type(e).__name__}: {e}",
-                    }]
+                    results_by_idx[idx] = [
+                        {
+                            "tool": name,
+                            "command": "",
+                            "returncode": -3,
+                            "log_tail": f"[scanner task crashed] {type(e).__name__}: {e}",
+                        }
+                    ]
     for idx in sorted(results_by_idx):
         ran.extend(results_by_idx[idx])
     return ran
@@ -1343,9 +1499,17 @@ def _build_registry(target, out_dir, agent_rules, detect_info):
             "available": lambda: have("bandit"),
             "factory": lambda: _tool_thunk(
                 "bandit",
-                ["bandit", "-r", target, "-f", "json", "-o",
-                 os.path.join(out_dir, "bandit.json"),
-                 "-x", "*/tests/*,*/venv/*,*/.venv/*"],
+                [
+                    "bandit",
+                    "-r",
+                    target,
+                    "-f",
+                    "json",
+                    "-o",
+                    os.path.join(out_dir, "bandit.json"),
+                    "-x",
+                    "*/tests/*,*/venv/*,*/.venv/*",
+                ],
             ),
         },
         # --- Go ---
@@ -1355,8 +1519,12 @@ def _build_registry(target, out_dir, agent_rules, detect_info):
             "available": lambda: have("gosec"),
             "factory": lambda: _tool_thunk(
                 "gosec",
-                ["gosec", "-fmt=sarif",
-                 f"-out={os.path.join(out_dir, 'gosec.sarif')}", "./..."],
+                [
+                    "gosec",
+                    "-fmt=sarif",
+                    f"-out={os.path.join(out_dir, 'gosec.sarif')}",
+                    "./...",
+                ],
                 cwd=target,
             ),
         },
@@ -1377,8 +1545,13 @@ def _build_registry(target, out_dir, agent_rules, detect_info):
             "available": lambda: have("cppcheck"),
             "factory": lambda: _tool_thunk(
                 "cppcheck",
-                ["cppcheck", "--enable=warning,portability",
-                 "--xml", "--xml-version=2", target],
+                [
+                    "cppcheck",
+                    "--enable=warning,portability",
+                    "--xml",
+                    "--xml-version=2",
+                    target,
+                ],
                 output_file=os.path.join(out_dir, "cppcheck.xml"),
                 output_stream="stderr",
             ),
@@ -1390,26 +1563,41 @@ def _build_registry(target, out_dir, agent_rules, detect_info):
             "available": lambda: have("brakeman"),
             "factory": lambda: _tool_thunk(
                 "brakeman",
-                ["brakeman", "-f", "sarif", "-o",
-                 os.path.join(out_dir, "brakeman.sarif"), target],
+                [
+                    "brakeman",
+                    "-f",
+                    "sarif",
+                    "-o",
+                    os.path.join(out_dir, "brakeman.sarif"),
+                    target,
+                ],
             ),
             # Dynamic skip: brakeman exits non-zero on non-Ruby projects.
             # Use detect_info["has_gemfile"] instead of a redundant directory
             # walk (_has_ruby_code) — the detection step already has this info.
-            "skip_reason": (lambda: None if has_gemfile else
-                            "no Ruby files or Gemfile found — brakeman only works on Ruby projects"),
+            "skip_reason": (
+                lambda: (
+                    None
+                    if has_gemfile
+                    else "no Ruby files or Gemfile found — brakeman only works on Ruby projects"
+                )
+            ),
         },
         # --- PHP ---
         {
             "name": "psalm",
             "langs": {"php"},
-            "available": lambda: have("psalm") or os.path.exists(
-                os.path.join(target, "vendor/bin/psalm")),
+            "available": lambda: (
+                have("psalm")
+                or os.path.exists(os.path.join(target, "vendor/bin/psalm"))
+            ),
             "factory": lambda: _tool_thunk(
                 "psalm",
-                ["psalm" if have("psalm") else "vendor/bin/psalm",
-                 "--taint-analysis",
-                 f"--report={os.path.join(out_dir, 'psalm.sarif')}"],
+                [
+                    "psalm" if have("psalm") else "vendor/bin/psalm",
+                    "--taint-analysis",
+                    f"--report={os.path.join(out_dir, 'psalm.sarif')}",
+                ],
                 cwd=target,
             ),
             "skip_reason": "not installed or no composer.json — relying on semgrep's PHP ruleset",
@@ -1460,8 +1648,16 @@ def _build_registry(target, out_dir, agent_rules, detect_info):
             "available": lambda: _eslint_security_configured(target),
             "factory": lambda: _tool_thunk(
                 "eslint-security",
-                ["npx", "--no-install", "eslint", "--format", "json",
-                 "--output-file", os.path.join(out_dir, "eslint-security.json"), "."],
+                [
+                    "npx",
+                    "--no-install",
+                    "eslint",
+                    "--format",
+                    "json",
+                    "--output-file",
+                    os.path.join(out_dir, "eslint-security.json"),
+                    ".",
+                ],
                 cwd=target,
             ),
             "skip_reason": "eslint config not found or eslint-plugin-security not wired — see references/tools.md",
@@ -1519,7 +1715,11 @@ def _dispatch_registry(registry, langs):
             if thunk is not None:
                 tasks.append((entry["name"], thunk))
         else:
-            reason = skip_fn if isinstance(skip_fn, str) else "not installed — run install_tools.sh"
+            reason = (
+                skip_fn
+                if isinstance(skip_fn, str)
+                else "not installed — run install_tools.sh"
+            )
             skipped.append({"tool": entry["name"], "reason": reason})
 
     return tasks, skipped
@@ -1535,7 +1735,10 @@ def _get_changed_files(target, since="HEAD~1"):
     try:
         proc = subprocess.run(
             ["git", "diff", "--name-only", "--diff-filter=ACMR", since],
-            cwd=target, capture_output=True, text=True, timeout=30,
+            cwd=target,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if proc.returncode != 0:
             return None
@@ -1557,9 +1760,7 @@ def _file_hash_cache_path(target):
     project). The cache contains file-hashes.json mapping (path -> sha256).
     """
     proj_hash = hashlib.sha256(os.path.abspath(target).encode()).hexdigest()[:16]
-    return os.path.join(
-        os.path.expanduser("~"), ".tiangang", "cache", proj_hash
-    )
+    return os.path.join(os.path.expanduser("~"), ".tiangang", "cache", proj_hash)
 
 
 def _load_file_hash_cache(target):
@@ -1625,7 +1826,14 @@ def _ci_exit_code(findings_by_severity, gate):
         return 0
     gate_levels = {"critical": 4, "high": 3, "medium": 2, "low": 1}
     gate_rank = gate_levels.get(gate, 4)
-    severity_ranks = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 1, "unknown": 1}
+    severity_ranks = {
+        "critical": 4,
+        "high": 3,
+        "medium": 2,
+        "low": 1,
+        "info": 1,
+        "unknown": 1,
+    }
     max_sev = 0
     for sev, count in findings_by_severity.items():
         if count > 0:
@@ -1643,7 +1851,13 @@ def _write_github_annotations(findings, out_dir):
     annotation line.
     """
     annotations_path = os.path.join(out_dir, "github-annotations.txt")
-    severity_to_cmd = {"critical": "error", "high": "error", "medium": "warning", "low": "warning", "info": "notice"}
+    severity_to_cmd = {
+        "critical": "error",
+        "high": "error",
+        "medium": "warning",
+        "low": "warning",
+        "info": "notice",
+    }
     lines = []
     for f in findings:
         cmd = severity_to_cmd.get(f.get("severity", "unknown"), "warning")
@@ -1796,7 +2010,8 @@ def main():
     )
     parser.add_argument(
         "--max-depth",
-        type=int, default=0,
+        type=int,
+        default=0,
         help="Maximum directory depth for language detection (0 = unlimited). "
         "Useful for large monorepos.",
     )
@@ -1822,8 +2037,7 @@ def main():
     parser.add_argument(
         "--since",
         default="HEAD~1",
-        help="Git ref for --diff-only (default: HEAD~1). "
-        "E.g. main, HEAD~5, abc1234.",
+        help="Git ref for --diff-only (default: HEAD~1). E.g. main, HEAD~5, abc1234.",
     )
     parser.add_argument(
         "--sequential",
@@ -1850,18 +2064,21 @@ def main():
     )
     parser.add_argument(
         "--ocr-delay",
-        type=int, default=5,
+        type=int,
+        default=5,
         help="Delay in seconds between OCR batch scans (default: 5). "
         "Prevents rate limiting with RPM=20.",
     )
     parser.add_argument(
         "--ocr-retry",
-        type=int, default=2,
+        type=int,
+        default=2,
         help="Max retry rounds for failed OCR files (default: 2).",
     )
     parser.add_argument(
         "--ocr-timeout",
-        type=int, default=60,
+        type=int,
+        default=60,
         help="Per-file timeout in minutes for OCR scans (default: 60).",
     )
     args = parser.parse_args()
@@ -1889,21 +2106,24 @@ def main():
     # warned and dropped rather than silently skipped (a typo like "pyton"
     # would otherwise produce a semgrep-only scan with no indication why).
     if args.langs:
-        unknown = [l for l in langs if l not in SUPPORTED_LANGS]
+        unknown = [x for x in langs if x not in SUPPORTED_LANGS]
         for u in unknown:
             print(
                 f"warning: unsupported language '{u}' — skipping "
                 f"(supported: {', '.join(sorted(SUPPORTED_LANGS))})",
                 file=sys.stderr,
             )
-        langs = [l for l in langs if l in SUPPORTED_LANGS]
+        langs = [x for x in langs if x in SUPPORTED_LANGS]
     print(f"Languages: {langs or '(none detected — semgrep only)'}")
 
     # Build the scan plan via the tool registry (data-driven dispatch).
     # Order is preserved in the manifest via task-index reassembly in
     # _run_concurrently.
     registry = _build_registry(
-        target, out_dir, args.agent_rules, detect_info,
+        target,
+        out_dir,
+        args.agent_rules,
+        detect_info,
     )
     tasks, skipped = _dispatch_registry(registry, langs)
 
@@ -1913,11 +2133,12 @@ def main():
         changed = _get_changed_files(target, since=args.since)
         if changed is not None:
             diff_mode = True
-            print(f"Incremental scan: {len(changed)} changed file(s) since {args.since}")
+            print(
+                f"Incremental scan: {len(changed)} changed file(s) since {args.since}"
+            )
             # Update file hash cache — only run tools on changed files.
             cache, cache_manifest = _load_file_hash_cache(target)
             now_iso = datetime.now(timezone.utc).isoformat()
-            changed_set = set(changed)
             # Check which changed files actually have new content (hash diff).
             truly_changed = []
             for fpath in changed:
@@ -1951,7 +2172,9 @@ def main():
         # In diff-only mode, pass changed files to OCR so it only reviews those
         diff_files_for_ocr = changed if (args.diff_only and diff_mode) else None
         ocr_thunk = _ocr_thunk(
-            target, out_dir, ocr_mode,
+            target,
+            out_dir,
+            ocr_mode,
             ocr_background=args.ocr_background,
             ocr_delay=args.ocr_delay,
             ocr_retry=args.ocr_retry,
@@ -1961,11 +2184,17 @@ def main():
         ocr_ran = list(ocr_thunk())
         ran.extend(ocr_ran)
         for entry in ocr_ran:
-            status = "ok" if entry.get("returncode", -1) == 0 else f"rc={entry.get('returncode', '?')}"
+            status = (
+                "ok"
+                if entry.get("returncode", -1) == 0
+                else f"rc={entry.get('returncode', '?')}"
+            )
             print(f"  OCR [{status}]: {entry.get('log_tail', '')[-120:]}")
     elif args.ocr or args.ocr_delegate:
-        print("\nwarning: --ocr/--ocr-delegate set but ocr CLI not installed — skipping AI review",
-              file=sys.stderr)
+        print(
+            "\nwarning: --ocr/--ocr-delegate set but ocr CLI not installed — skipping AI review",
+            file=sys.stderr,
+        )
 
     # Secret-on-disk defense in depth: raw tool outputs in out_dir carry
     # credential material verbatim (gitleaks Secret/Match, trufflehog Raw,
@@ -2007,6 +2236,7 @@ def main():
         # Import generate_report to parse findings for CI exit code.
         sys.path.insert(0, SCRIPT_DIR)
         from generate_report import collect_findings
+
         findings, _ = collect_findings(out_dir)
         if findings:
             annotations_path = _write_github_annotations(findings, out_dir)
@@ -2027,7 +2257,9 @@ def main():
         )
         sys.exit(exit_code)
     else:
-        print(f"Next: python3 {os.path.join(SCRIPT_DIR, 'generate_report.py')} {out_dir!r}")
+        print(
+            f"Next: python3 {os.path.join(SCRIPT_DIR, 'generate_report.py')} {out_dir!r}"
+        )
         print(
             f"      python3 {os.path.join(SCRIPT_DIR, 'sarif_report.py')} {out_dir!r} --output {os.path.join(out_dir, 'report.sarif')}"
         )

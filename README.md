@@ -11,7 +11,7 @@
 - **四步工作流**（`scripts/` 四个脚本，逐步输入输出衔接）：`detect_languages` 检测语言 → `install_tools` 补齐工具 → `run_scan` 运行扫描 → `generate_report` 统一报告
 - **通用 SAST**：Semgrep（语言无关，始终运行，捕获硬编码密钥等跨语言模式）；CodeQL（深度扫描，opt-in，不进默认流程，见 `references/codeql.md`）
 - **SCA + 密钥双通道**（无论检测到哪些语言都运行）：Trivy 全生态依赖 CVE（安装链钉定 v0.74.0 并校验 SHA256，DB 陈旧信号物化到 `trivy-version.json`，零结果不再误读为"安全"）；Gitleaks + Trufflehog 独立密钥双通道，与 Semgrep `p/secrets` 解耦——parser 层只保留 rule id/detector name，凭证原文绝不落盘进报告（`redact.py` 为 defense in depth）
-- **10 组语言专属扫描器**：Python→Bandit；Java→FindSecBugs；Go→Gosec；C/C++→Flawfinder+Cppcheck；Ruby→Brakeman；PHP→Psalm；.NET→Security Code Scan；Rust→cargo-audit+Miri；JS/TS→njsscan+retire.js+eslint-plugin-security；IaC→checkov+tfsec
+- **10 种语言专属扫描器**：Python→Bandit；Java→FindSecBugs；Go→Gosec；C/C++→Flawfinder+Cppcheck；Ruby→Brakeman；PHP→Psalm；.NET→Security Code Scan；Rust→cargo-audit+Miri；JS/TS→njsscan+retire.js+eslint-plugin-security；IaC→checkov+tfsec
 - **AI 代码审查（OCR，单独触发）**：`--ocr` 全文件审计 / `--ocr-delegate` git diff 审查，SAST 完成后独立运行，捕获逻辑 bug、性能与可维护性问题
 - **Agent 代码库反模式规则**：`--agent-rules` 加载 `rules/agent-antipatterns.yml`，把 12-factor-agents 架构违规（框架黑盒实例化、缺失 intent dispatch、无显式循环的图编排等）作为 SAST 信号
 - **工程化能力**：`--ci` 模式（退出码反映严重级别 + GitHub Actions annotations）、`--gate` 门禁阈值、`--diff-only` 增量扫描（哈希缓存）、`--format md|html|json`、`--trend` 趋势对比、`--triage` LLM 误报过滤提示词、三层 finding 去重与多工具确认标记

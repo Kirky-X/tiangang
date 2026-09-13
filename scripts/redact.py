@@ -84,7 +84,12 @@ _SECRET_PATTERNS: List[Tuple[re.Pattern, object]] = [
     ),
     # --- JWT tokens ---
     # JWT format: header.payload.signature (base64url-encoded).
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), REDACTED),
+    (
+        re.compile(
+            r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+        ),
+        REDACTED,
+    ),
     # --- npm tokens ---
     (re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"), REDACTED),
     # --- PyPI tokens ---

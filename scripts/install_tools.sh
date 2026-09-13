@@ -98,7 +98,7 @@ TRIVY_VERSION="0.74.0"
 install_trivy_with_checksum() {
   local tmpdir
   tmpdir=$(mktemp -d /tmp/trivy-install.XXXXXX)
-  trap "rm -rf '$tmpdir'" RETURN
+  trap 'rm -rf "$tmpdir"' RETURN
 
   # goreleaser asset naming (see the release's checksums.txt): OS is
   # capitalized ("Linux"/"macOS") and arch is 64bit / ARM64 / ARM (32-bit).

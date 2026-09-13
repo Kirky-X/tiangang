@@ -187,7 +187,9 @@ def main():
     parser.add_argument("target")
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
-        "--max-depth", type=int, default=0,
+        "--max-depth",
+        type=int,
+        default=0,
         help="Maximum directory depth to traverse (0 = unlimited). "
         "Useful for large monorepos.",
     )

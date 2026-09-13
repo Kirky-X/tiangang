@@ -239,7 +239,9 @@ def parse_cppcheck(path):
         # fallback (see import above) is safe because ElementTree does not
         # resolve external entities by default. nosemgrep suppresses the
         # static flag on the fallback path.
-        tree = ET.parse(path)  # nosemgrep: python.lang.security.use-defused-xml-parse.use-defused-xml-parse
+        tree = ET.parse(
+            path
+        )  # nosemgrep: python.lang.security.use-defused-xml-parse.use-defused-xml-parse
     except Exception as e:
         return [], f"could not parse {path}: {e}"
     for err in tree.getroot().iter("error"):
@@ -709,10 +711,16 @@ def parse_checkov(path):
         message = f"{check_id}: {check.get('name', '')} (resource: {resource})"
         if guideline:
             message += f" — see {guideline}"
-        findings.append({
-            "tool": "checkov", "rule": check_id, "severity": severity,
-            "file": file_path, "line": line_no, "message": message,
-        })
+        findings.append(
+            {
+                "tool": "checkov",
+                "rule": check_id,
+                "severity": severity,
+                "file": file_path,
+                "line": line_no,
+                "message": message,
+            }
+        )
     return findings, None
 
 
@@ -738,10 +746,16 @@ def parse_tfsec(path):
         message = r.get("description", "") or r.get("rule_description", "")
         if r.get("resolution"):
             message += f" — fix: {r['resolution']}"
-        findings.append({
-            "tool": "tfsec", "rule": rule_id, "severity": severity,
-            "file": file_path, "line": line, "message": message,
-        })
+        findings.append(
+            {
+                "tool": "tfsec",
+                "rule": rule_id,
+                "severity": severity,
+                "file": file_path,
+                "line": line,
+                "message": message,
+            }
+        )
     return findings, None
 
 
@@ -885,7 +899,11 @@ def _proximity_match(deduped, proximity_list, f):
     f_file = f["file"]
     f_cwe = f.get("cwe")
     for p_file, p_line, p_cwe, _idx in proximity_list:
-        if p_file == f_file and p_cwe == f_cwe and abs(p_line - f_line) <= _PROXIMITY_LINES:
+        if (
+            p_file == f_file
+            and p_cwe == f_cwe
+            and abs(p_line - f_line) <= _PROXIMITY_LINES
+        ):
             return True
     return False
 
@@ -1076,12 +1094,17 @@ def render_html_report(results_dir, findings, parse_errors, manifest):
     Findings are grouped by severity (critical → info) with color-coded badges.
     """
     import html as html_mod
+
     by_sev = defaultdict(int)
     for f in findings:
         by_sev[f["severity"]] += 1
     sev_colors = {
-        "critical": "#d32f2f", "high": "#f57c00", "medium": "#fbc02d",
-        "low": "#388e3c", "info": "#1976d2", "unknown": "#757575",
+        "critical": "#d32f2f",
+        "high": "#f57c00",
+        "medium": "#fbc02d",
+        "low": "#388e3c",
+        "info": "#1976d2",
+        "unknown": "#757575",
     }
     target = html_mod.escape(manifest.get("target", results_dir))
     langs = ", ".join(manifest.get("languages", [])) or "(none detected)"
@@ -1100,7 +1123,7 @@ def render_html_report(results_dir, findings, parse_errors, manifest):
         ".finding .msg { margin-top: 0.25rem; }",
         ".confirmed { color: #1976d2; font-size: 0.8rem; }",
         "</style></head><body>",
-        f"<h1>Security Audit Report</h1>",
+        "<h1>Security Audit Report</h1>",
         f'<div class="meta">Target: <code>{target}</code><br>Languages: {html_mod.escape(langs)}<br>Generated: {ts}</div>',
         '<div class="summary">',
     ]
@@ -1108,15 +1131,25 @@ def render_html_report(results_dir, findings, parse_errors, manifest):
         cnt = by_sev.get(sev, 0)
         if cnt:
             color = sev_colors.get(sev, "#757575")
-            parts.append(f'<span class="badge" style="background:{color}">{sev.upper()}: {cnt}</span>')
-    parts.append(f'<span class="badge" style="background:#424242">Total: {len(findings)}</span>')
+            parts.append(
+                f'<span class="badge" style="background:{color}">{sev.upper()}: {cnt}</span>'
+            )
+    parts.append(
+        f'<span class="badge" style="background:#424242">Total: {len(findings)}</span>'
+    )
     parts.append("</div>")
     if not findings:
-        parts.append("<p>No findings. This does not guarantee the code is free of security issues.</p>")
+        parts.append(
+            "<p>No findings. This does not guarantee the code is free of security issues.</p>"
+        )
     else:
         findings_sorted = sorted(
             findings,
-            key=lambda f: (SEVERITY_RANK.get(f["severity"], 99), f["file"], _line_sort_key(f["line"])),
+            key=lambda f: (
+                SEVERITY_RANK.get(f["severity"], 99),
+                f["file"],
+                _line_sort_key(f["line"]),
+            ),
         )
         current_sev = None
         for f in findings_sorted:
@@ -1125,7 +1158,9 @@ def render_html_report(results_dir, findings, parse_errors, manifest):
                     parts.append("</div>")
                 current_sev = f["severity"]
                 color = sev_colors.get(current_sev, "#757575")
-                parts.append(f'<h2 style="color:{color}">{current_sev.capitalize()}</h2><div>')
+                parts.append(
+                    f'<h2 style="color:{color}">{current_sev.capitalize()}</h2><div>'
+                )
             tool_rule = html_mod.escape(f"{f['tool']}:{f['rule']}")
             loc = html_mod.escape(f"{f['file']}:{f['line']}")
             msg = html_mod.escape(f.get("message", ""))
@@ -1152,15 +1187,18 @@ def render_json_report(results_dir, findings, parse_errors, manifest):
     by_sev = defaultdict(int)
     for f in findings:
         by_sev[f["severity"]] += 1
-    return json.dumps({
-        "target": manifest.get("target", results_dir),
-        "languages": manifest.get("languages", []),
-        "timestamp": manifest.get("timestamp", ""),
-        "summary": {"total": len(findings), **dict(by_sev)},
-        "skipped_tools": manifest.get("skipped", []),
-        "parse_errors": parse_errors,
-        "findings": findings,
-    }, indent=2)
+    return json.dumps(
+        {
+            "target": manifest.get("target", results_dir),
+            "languages": manifest.get("languages", []),
+            "timestamp": manifest.get("timestamp", ""),
+            "summary": {"total": len(findings), **dict(by_sev)},
+            "skipped_tools": manifest.get("skipped", []),
+            "parse_errors": parse_errors,
+            "findings": findings,
+        },
+        indent=2,
+    )
 
 
 def main():
@@ -1209,7 +1247,11 @@ def main():
         # secret-redacted code snippet — reachability is not judgeable from
         # metadata alone (see generate_triage_prompt).
         prompt = generate_triage_prompt(findings, context=manifest.get("target"))
-        triage_path = args.out and args.out.replace(".md", ".triage.txt") or os.path.join(results_dir, "triage_prompt.txt")
+        triage_path = (
+            args.out
+            and args.out.replace(".md", ".triage.txt")
+            or os.path.join(results_dir, "triage_prompt.txt")
+        )
         with open(triage_path, "w") as f:
             f.write(prompt)
         print(f"Triage prompt written to {triage_path} ({len(findings)} findings)")
@@ -1362,7 +1404,9 @@ def generate_triage_prompt(findings, context=None):
             )
             if snippet is not None:
                 snippets_shown += 1
-                lines.append(f"   Code context ({f.get('file')}:{start}-{end}, secret-redacted):")
+                lines.append(
+                    f"   Code context ({f.get('file')}:{start}-{end}, secret-redacted):"
+                )
                 for ln in snippet.splitlines():
                     lines.append(f"   {ln}")
         if snippet is None:
@@ -1386,6 +1430,7 @@ def load_trend_history(results_dir, max_entries=10):
     Used to show whether findings are increasing/decreasing over time.
     """
     import hashlib
+
     manifest_path = os.path.join(results_dir, "scan_manifest.json")
     if not os.path.exists(manifest_path):
         return []
@@ -1393,9 +1438,7 @@ def load_trend_history(results_dir, max_entries=10):
         manifest = json.load(f)
     target = manifest.get("target", "")
     proj_hash = hashlib.sha256(target.encode()).hexdigest()[:16]
-    trend_dir = os.path.join(
-        os.path.expanduser("~"), ".tiangang", "trends", proj_hash
-    )
+    trend_dir = os.path.join(os.path.expanduser("~"), ".tiangang", "trends", proj_hash)
     os.makedirs(trend_dir, exist_ok=True)
     # Load existing trend file.
     trend_file = os.path.join(trend_dir, "trend_history.json")
@@ -1417,11 +1460,10 @@ def save_trend_entry(results_dir, findings, manifest):
     mix their histories.
     """
     import hashlib
+
     target = manifest.get("target", "")
     proj_hash = hashlib.sha256(target.encode()).hexdigest()[:16]
-    trend_dir = os.path.join(
-        os.path.expanduser("~"), ".tiangang", "trends", proj_hash
-    )
+    trend_dir = os.path.join(os.path.expanduser("~"), ".tiangang", "trends", proj_hash)
     os.makedirs(trend_dir, exist_ok=True)
     trend_file = os.path.join(trend_dir, "trend_history.json")
     history = []
