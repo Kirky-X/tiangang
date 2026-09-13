@@ -45,10 +45,10 @@ yarn-error.log*
 .meta
 # 扫描产物
 .security-audit
-# 测试代码（开发期使用，不入仓库）
-tests/
-**/tests/
-**/test/
+# 测试代码入仓库（CI 依赖；pytest tests/ 即 503 项回归）
+# 仅排除 vendored 上游副本内的测试目录
+/open-code-review/**/tests/
+/open-code-review/**/test/
 # Darwin skill 优化产物（开发期使用，不入仓库）
 results.tsv
 test-prompts.json
