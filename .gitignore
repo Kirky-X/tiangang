@@ -1,5 +1,6 @@
 .claude
-.claude-plugin/
+.claude-plugin/*
+!.claude-plugin/marketplace.json
 .venv
 openspec/
 specmark/
