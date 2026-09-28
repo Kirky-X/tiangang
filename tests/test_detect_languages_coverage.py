@@ -417,6 +417,71 @@ class TestIaCDetection(unittest.TestCase):
         self.assertIn("iac", strong)
 
 
+class TestGithubWorkflowsSignal(unittest.TestCase):
+    """.github/workflows/*.yml|.yaml 以相对路径匹配纳入 IaC 强信号（P1）。
+
+    纯文件名匹配表达不了路径约束——workflow YAML 只有位于 .github/workflows/
+    下才是 CI 信号；.github 平时按隐藏目录跳过，需开例外放行。
+    """
+
+    def test_workflow_yml_makes_iac_strong(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(Path(tmp) / ".github" / "workflows" / "ci.yml", "on: push")
+            ordered, ext_counts, strong = dl.detect(tmp)
+        self.assertIn("iac", strong)
+        self.assertIn("iac", ordered)
+
+    def test_workflow_yaml_variant_also_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(Path(tmp) / ".github" / "workflows" / "ci.yaml", "on: push")
+            _, _, strong = dl.detect(tmp)
+        self.assertIn("iac", strong)
+
+    def test_workflow_single_hit_enough(self):
+        """CI 工作流是授权代码——一个文件即强信号，无扩展名计数要求。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(Path(tmp) / ".github" / "workflows" / "only-one.yml")
+            _, ext_counts, strong = dl.detect(tmp)
+        self.assertIn("iac", strong)
+        self.assertEqual(ext_counts.get("iac", 0), 0)
+
+    def test_root_level_yml_not_signal(self):
+        """根目录的 deploy.yml 不在 workflows 路径下，不触发 IaC。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(Path(tmp) / "deploy.yml", "on: push")
+            _, _, strong = dl.detect(tmp)
+        self.assertNotIn("iac", strong)
+
+    def test_github_non_workflows_dir_not_signal(self):
+        """同在 .github 下但不在 workflows/ 的 yml 不触发。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(Path(tmp) / ".github" / "ISSUE_TEMPLATE" / "x.yml")
+            _, _, strong = dl.detect(tmp)
+        self.assertNotIn("iac", strong)
+
+    def test_nested_github_workflows_not_signal(self):
+        """非扫描根的 .github/workflows（子包内）不触发——信号相对扫描根。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(Path(tmp) / "sub" / ".github" / "workflows" / "ci.yml")
+            _, _, strong = dl.detect(tmp)
+        self.assertNotIn("iac", strong)
+
+    def test_non_yml_file_in_workflows_not_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(Path(tmp) / ".github" / "workflows" / "README.txt")
+            _, _, strong = dl.detect(tmp)
+        self.assertNotIn("iac", strong)
+
+    def test_hidden_dirs_other_than_github_still_skipped(self):
+        """例外只给 .github；其他隐藏目录（如 .gitlab）仍整体跳过。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            for i in range(5):
+                write_file(Path(tmp) / ".gitlab" / f"a{i}.py")
+            ordered, ext_counts, _ = dl.detect(tmp)
+        self.assertNotIn("python", ext_counts)
+        self.assertNotIn("python", ordered)
+
+
 class TestMainCliSmoke(unittest.TestCase):
     """端到端烟雾测试：验证脚本可作为 CLI 运行（覆盖 if __name__ == '__main__'）。"""
 

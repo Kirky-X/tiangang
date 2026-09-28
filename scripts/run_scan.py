@@ -168,6 +168,11 @@ def get_plugins():
 SEMGREP_JOBS = 4
 SEMGREP_TIMEOUT = 20  # seconds, per file
 
+# Bundled offline semgrep rule files live in the repo-root rules/ dir — the
+# same place agent-antipatterns.yml lives (that one is passed in by the caller
+# via --agent-rules; the ones _run_semgrep loads itself resolve from here).
+_RULES_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, os.pardir, "rules"))
+
 
 def sh(cmd, cwd=None, timeout=600):
     """Run a command (list form), returning (returncode, combined_output). Never raises.
@@ -322,35 +327,83 @@ def _has_ruby_code(target):
     return False
 
 
+def _has_ci_workflows(target):
+    """True iff the target has GitHub Actions workflow definitions.
+
+    ``.github/workflows/*.yml|.yaml`` is CI authorization surface (untrusted
+    inputs flowing into privileged jobs, per the supply-chain reference), so
+    its presence adds the ``p/github-actions`` ruleset to the semgrep chain.
+    An empty workflows dir adds nothing — no reason to pay for a registry
+    ruleset that has nothing to match.
+    """
+    wf_dir = os.path.join(target, ".github", "workflows")
+    if not os.path.isdir(wf_dir):
+        return False
+    try:
+        return any(
+            os.path.isfile(os.path.join(wf_dir, f))
+            and f.endswith((".yml", ".yaml"))
+            for f in os.listdir(wf_dir)
+        )
+    except OSError:
+        return False
+
+
 def _run_semgrep(target, out_dir, ran, agent_rules=None):
     """Run semgrep with offline fallback and optional agent rules.
 
     Flags absorbed from strix's semgrep CLI playbook:
     - ``--metrics=off``: semgrep sends telemetry by default; explicit off is
       both a privacy requirement and a correctness guard (the metrics call can
-      fail in restricted networks and break the scan).
+      fail in restricted networks and break the scan). NOT passed on the
+      ``--config auto`` attempt: semgrep >=1.168 rejects that combination
+      outright ("Cannot create auto config when metrics are off"), and that
+      message carries none of the fallback keywords below, so the offline
+      fallback never fired and the scan just failed. ``auto`` needs registry
+      network access anyway; the metrics opt-out applies to the offline
+      fallback and agent-rules passes, which don't use ``auto``.
     - ``--quiet``: suppress progress noise in automation.
     - ``--jobs`` / ``--timeout``: explicit values so runs are reproducible
       across hosts instead of depending on semgrep's host-dependent defaults.
     """
     sarif = os.path.join(out_dir, "semgrep.sarif")
+    web_baseline = os.path.join(_RULES_DIR, "web-baseline.yml")
+    # Bundled offline baseline rules — always enabled (both the online chain
+    # and the offline fallback; local file, no network dependency). Missing
+    # file is a warning, not a crash: the chain degrades to registry configs.
+    baseline = []
+    if os.path.isfile(web_baseline):
+        baseline = ["--config", web_baseline]
+    else:
+        print(
+            f"warning: bundled web-baseline rules not found: {web_baseline}",
+            file=sys.stderr,
+        )
     semgrep_cmd = [
         "semgrep",
         "scan",
         "--config",
         "auto",
-        "--metrics=off",
-        "--quiet",
-        "--jobs",
-        str(SEMGREP_JOBS),
-        "--timeout",
-        str(SEMGREP_TIMEOUT),
-        "--exclude=.security-audit",
-        "--sarif",
-        "--output",
-        sarif,
-        target,
+        *baseline,
     ]
+    # CI workflow definitions present → registry GitHub Actions ruleset
+    # (online; the offline fallback below deliberately drops it).
+    if _has_ci_workflows(target):
+        semgrep_cmd.extend(["--config", "p/github-actions"])
+    semgrep_cmd.extend(
+        [
+            "--quiet",
+            "--jobs",
+            str(SEMGREP_JOBS),
+            "--timeout",
+            str(SEMGREP_TIMEOUT),
+            "--exclude=.security-audit",
+            "--sarif",
+            "--output",
+            sarif,
+            target,
+        ]
+    )
     rc, out = sh(semgrep_cmd, timeout=900)
     # B4: preserve first-attempt error so debugging info isn't lost on fallback.
     # Previously `out` and `semgrep_cmd` were reassigned, dropping the original
@@ -369,6 +422,7 @@ def _run_semgrep(target, out_dir, ran, agent_rules=None):
         semgrep_cmd = [
             "semgrep",
             "scan",
+            *baseline,
             "--config",
             "p/security-audit",
             "--config",
@@ -412,19 +466,34 @@ def _run_semgrep(target, out_dir, ran, agent_rules=None):
     # Load agent antipattern rules if requested (for LangChain/CrewAI/etc. codebases)
     if agent_rules and os.path.exists(agent_rules):
         agent_sarif = os.path.join(out_dir, "semgrep-agent.sarif")
+        llm_security = os.path.join(_RULES_DIR, "llm-security.yml")
         agent_cmd = [
             "semgrep",
             "scan",
             "--config",
             agent_rules,
-            "--metrics=off",
-            "--quiet",
-            "--exclude=.security-audit",
-            "--sarif",
-            "--output",
-            agent_sarif,
-            target,
         ]
+        # llm-security.yml loads alongside agent-antipatterns.yml: one agent-
+        # codebase scan pass, both offline local rule files. Missing file is a
+        # warning, not a crash — same degradation contract as web-baseline.
+        if os.path.isfile(llm_security):
+            agent_cmd.extend(["--config", llm_security])
+        else:
+            print(
+                f"warning: bundled llm-security rules not found: {llm_security}",
+                file=sys.stderr,
+            )
+        agent_cmd.extend(
+            [
+                "--metrics=off",
+                "--quiet",
+                "--exclude=.security-audit",
+                "--sarif",
+                "--output",
+                agent_sarif,
+                target,
+            ]
+        )
         run_tool("semgrep-agent", ran, agent_cmd, timeout=900)
     elif agent_rules:
         print(
@@ -614,15 +683,92 @@ def _retire_thunk(target, out_dir):
     return _run
 
 
+def _ocr_project_kind(target):
+    """Map the target's manifests to a project kind (single probe point).
+
+    Used by both _ocr_detect_project_type (review background) and the
+    _OCR_SECURITY_PRESETS lookup (security hunting preset) so the two always
+    agree on the detected kind. Probe priority mirrors ocr_scan.sh's
+    detect_background(): Cargo.toml → go.mod → package.json →
+    requirements.txt/pyproject.toml → pubspec.yaml → generic.
+    """
+    if os.path.isfile(os.path.join(target, "Cargo.toml")):
+        return "rust"
+    if os.path.isfile(os.path.join(target, "go.mod")):
+        return "go"
+    if os.path.isfile(os.path.join(target, "package.json")):
+        return "node"
+    if os.path.isfile(os.path.join(target, "requirements.txt")) or os.path.isfile(
+        os.path.join(target, "pyproject.toml")
+    ):
+        return "python"
+    if os.path.isfile(os.path.join(target, "pubspec.yaml")):
+        return "flutter"
+    return "generic"
+
+
+# OCR security hunting presets (P2) — logic-level vulnerability questions
+# merged into the review background per project kind. Distilled from the CF
+# security-audit reference (business logic / auth / tenant isolation /
+# resource exhaustion); the full question lists live in
+# references/ocr-security-backgrounds.md, these are the prompt-sized presets.
+_OCR_SECURITY_PRESETS = {
+    "rust": (
+        "逻辑漏洞猎捕（静态规则抓不到，须逐工作流推演）：\n"
+        "1.业务逻辑: 状态机可否跳步/回退/重放已完成流程（部分失败是否回滚）？并发下检查-后-使用非原子的双花/双审/丢更新？金额与数量计算可否负值/零值/整数溢出（Rust 用 checked/带审计的算术了吗）？过期/调度/限流窗口在边界时刻与时区差异下的行为？\n"
+        "2.认证: JWT 的 exp/nbf/aud/iss 是否校验、kid/jku/x5u 是否当不可信 key selector、decode-without-verify 路径？OAuth redirect_uri 精确归属、state 会话绑定、code 绑定？登录/权限变更后 session 是否轮换、登出/改密后旧凭证是否失效？\n"
+        "3.租户隔离: 每条读写路径是否把对象绑定到已认证租户（还是信任 body 字段自报身份）？搜索/缓存/日志/导出等派生副本的 ACL 是否随主数据失效？exists/错误差异/时延是否构成枚举预言机？\n"
+        "4.资源: 小输入可否驱动超线性解析/正则回爆/图遍历？解压/嵌套反序列化膨胀是否在每级限制？配额记账维度可否被攻击者影响而逃逸预算？\n"
+    ),
+    "go": (
+        "逻辑漏洞猎捕（静态规则抓不到，须逐工作流推演）：\n"
+        "1.业务逻辑: 状态机可否跳步/回退/重放（部分失败是否回滚）？goroutine 并发下检查-后-使用非原子的双花/双审/丢更新？金额/数量可否负值/零值/溢出？过期/调度/限流窗口边界与时钟偏移？\n"
+        "2.认证: JWT 的 exp/nbf/aud/iss 校验、kid/jku/x5u key selector、decode-without-verify？OAuth redirect_uri/state/code 绑定？session 在登录/权限变更后轮换、登出后失效？\n"
+        "3.租户隔离: 每条读写路径是否绑定已认证租户（含直查/嵌套关系/后台/导入等旁路）？缓存/搜索/日志副本 ACL 漂移？错误差异/计数/时延枚举预言机？\n"
+        "4.资源: 小输入超线性解析/正则回爆/JSON 深度嵌套？解压放大是否逐级限额？context 取消后下游工作是否真正停止？配额维度可否逃逸？\n"
+    ),
+    "node": (
+        "逻辑漏洞猎捕（静态规则抓不到，须逐工作流推演）：\n"
+        "1.业务逻辑: 状态机可否跳步/回退/重放（部分失败是否回滚）？Promise 并发下检查-后-使用非原子的双花/双审/丢更新？金额/数量字符串-数字强转可否负值/精度丢失/溢出？过期/限流窗口边界与时区？\n"
+        "2.认证: JWT 的 exp/nbf/aud/iss 校验、算法固定（alg:none/HS-RS 混淆）、decode-without-verify？OAuth redirect_uri/state/PKCE 绑定？session 轮换与登出失效？\n"
+        "3.租户隔离: 每条读写路径是否绑定已认证租户（NoSQL 查询过滤与 ORM scope 旁路）？缓存/搜索索引/CDN 副本 ACL 漂移？错误差异/排序字段/响应大小枚举预言机？\n"
+        "4.资源: 小输入超线性解析（正则回爆/递归 JSON/原型污染改路径）？解压与 multipart 放大逐级限额？事件循环可否被单请求长期占用（同步重计算）？配额维度可否逃逸？\n"
+    ),
+    "python": (
+        "逻辑漏洞猎捕（静态规则抓不到，须逐工作流推演）：\n"
+        "1.业务逻辑: 状态机可否跳步/回退/重放（部分失败是否回滚）？并发下检查-后-使用非原子的双花/双审/丢更新？金额/数量可否负值/零值/精度丢失？过期/调度/限流窗口边界与时区？\n"
+        "2.认证: JWT 的 exp/nbf/aud/iss 校验、算法固定、decode-without-verify？OAuth redirect_uri/state/code 绑定？session 轮换与登出失效？\n"
+        "3.租户隔离: 每条读写路径是否绑定已认证租户（raw 查询/unscoped 旁路 ORM scope）？缓存/搜索/导出副本 ACL 漂移？错误差异/计数/时延枚举预言机？\n"
+        "4.资源: 小输入超线性解析/正则回爆/反序列化嵌套膨胀（yaml.load/pickle）？解压放大逐级限额？配额维度可否逃逸？\n"
+    ),
+    "flutter": (
+        "逻辑漏洞猎捕（客户端代码可被篡改，服务端校验才是边界）：\n"
+        "1.业务逻辑: 哪些「校验」只存在于客户端（可被绕过直调 API）？状态机可否跳步/回退/重放？金额/数量本地计算可否篡改？\n"
+        "2.认证: token 存储位置（SharedPreferences/内存）与泄露面？JWT 的 exp/aud 校验在客户端还是服务端？OAuth redirect_uri/state/deep-link 绑定（mobile 路由可否伪造回调）？\n"
+        "3.租户隔离: 列表/详情接口是否依赖客户端过滤而非服务端租户绑定？缓存/快照副本是否含越权数据？\n"
+        "4.资源: 大图/大列表无分页无上限渲染？轮询/重试风暴可否耗电耗流量放大？配额以设备维度还是服务端账号维度记账？\n"
+    ),
+    "generic": (
+        "逻辑漏洞猎捕（静态规则抓不到，须逐工作流推演）：\n"
+        "1.业务逻辑: 状态机可否跳步/回退/重放（部分失败是否回滚）？并发下检查-后-使用非原子的双花/双审/丢更新？数值可否负值/零值/溢出/精度丢失？过期/调度/限流窗口边界与时钟偏移？\n"
+        "2.认证: JWT 的 exp/nbf/aud/iss 校验、key selector 不可信、decode-without-verify？OAuth redirect_uri/state 绑定？session 轮换与登出/改密后失效？\n"
+        "3.租户隔离: 每条读写路径是否绑定已认证租户（旁路：直查/后台/导入/legacy）？派生副本（缓存/搜索/导出/日志）ACL 漂移？错误差异/计数/时延枚举预言机？\n"
+        "4.资源: 小输入超线性解析/正则回爆？解压与嵌套结构放大是否逐级限额？配额记账维度可否被攻击者影响而逃逸预算？\n"
+    ),
+}
+
+
 def _ocr_detect_project_type(target):
     """Detect project type from manifest files and return a review background.
 
     Mirrors ocr_scan.sh's detect_background() — checks for Cargo.toml (Rust),
     go.mod (Go), package.json (Node/TS), requirements.txt/pyproject.toml (Python),
     pubspec.yaml (Flutter/Dart). Returns a language-specific multi-dimension
-    review background string that OCR passes to the LLM as context.
+    review background string that OCR passes to the LLM as context. Kind
+    probing lives in _ocr_project_kind (shared with the security preset).
     """
-    if os.path.isfile(os.path.join(target, "Cargo.toml")):
+    kind = _ocr_project_kind(target)
+    if kind == "rust":
         return (
             "Rust项目全维度深度审查。必须覆盖以下全部维度：\n"
             "1.安全性: SQL注入/XSS/CSRF/路径注入/命令注入/敏感信息泄露/权限校验缺失\n"
@@ -634,7 +780,7 @@ def _ocr_detect_project_type(target):
             "7.性能: 循环内数据库查询(N+1)/O(n^2)查找/不必要分配/未预分配集合/热路径锁竞争\n"
             "8.测试覆盖: 关键逻辑路径是否有测试/边界条件覆盖"
         )
-    if os.path.isfile(os.path.join(target, "go.mod")):
+    if kind == "go":
         return (
             "Go项目全维度深度审查。必须覆盖：\n"
             "1.安全性: SQL注入/XSS/命令注入/敏感信息泄露/权限校验\n"
@@ -645,7 +791,7 @@ def _ocr_detect_project_type(target):
             "6.性能: 内存分配/切片预分配/字符串拼接\n"
             "7.测试覆盖: 表驱动测试/边界条件/mock注入"
         )
-    if os.path.isfile(os.path.join(target, "package.json")):
+    if kind == "node":
         return (
             "Node.js/TypeScript项目全维度深度审查。必须覆盖：\n"
             "1.安全性: XSS/注入/原型污染/敏感信息泄露/依赖漏洞\n"
@@ -655,14 +801,12 @@ def _ocr_detect_project_type(target):
             "5.可维护性: 命名/模块边界/循环依赖\n"
             "6.测试覆盖: 单元测试/mock/边界条件"
         )
-    if os.path.isfile(os.path.join(target, "requirements.txt")) or os.path.isfile(
-        os.path.join(target, "pyproject.toml")
-    ):
+    if kind == "python":
         return (
             "Python项目全维度深度审查。覆盖："
             "安全性/异常处理/类型提示/可变默认参数/性能/测试"
         )
-    if os.path.isfile(os.path.join(target, "pubspec.yaml")):
+    if kind == "flutter":
         return (
             "Flutter/Dart项目全维度深度审查。覆盖："
             "安全性/Widget重建性能/Stream泄漏/空安全/异步/测试"
@@ -901,7 +1045,8 @@ def _ocr_thunk(
 
     Environment setup (token, connectivity) is handled by _ocr_setup_env().
     Project-type-aware review background is generated by
-    _ocr_detect_project_type() and merged with user-supplied --ocr-background.
+    _ocr_detect_project_type(), merged with the per-kind security hunting
+    preset (_OCR_SECURITY_PRESETS) and user-supplied --ocr-background.
 
     OCR exits non-zero when findings exist — that's a finding, not a
     failure. Normalize rc=1 → 0 when the report file was produced.
@@ -925,11 +1070,15 @@ def _ocr_thunk(
             return r
 
         # --- Build background string ---
+        # Layered: project-type review background → security hunting preset
+        # (per project kind) → user-supplied --ocr-background last. Only
+        # reachable via --ocr/--ocr-delegate, so the opt-in boundary holds.
         lang_bg = _ocr_detect_project_type(target)
+        kind = _ocr_project_kind(target)
+        sec_bg = _OCR_SECURITY_PRESETS.get(kind, _OCR_SECURITY_PRESETS["generic"])
+        full_background = f"{lang_bg}\n\n{sec_bg}"
         if ocr_background:
-            full_background = f"{lang_bg}\n\n额外关注: {ocr_background}"
-        else:
-            full_background = lang_bg
+            full_background = f"{full_background}\n\n额外关注: {ocr_background}"
 
         if ocr_mode == "review":
             # Git diff-based review — no batching needed.

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Detect which languages a codebase uses, so the orchestrator knows which
-security tools to run. Combines strong signals (manifest files) with weak
-signals (file extension counts) — see references/tools.md for the table
-this mirrors.
+security tools to run. Combines strong signals (manifest files, plus CI
+workflow files under .github/workflows/) with weak signals (file extension
+counts) — see references/tools.md for the table this mirrors.
 
 Usage:
     python3 detect_languages.py <target-dir> [--json]
@@ -124,6 +124,22 @@ SKIP_DIRS = {
     ".eggs",
 }
 
+# Hidden directories exempt from the "skip dot-dirs" rule below. .github
+# normally counts as tool metadata, but its workflows/ subtree is CI
+# authorization code (untrusted inputs flowing into privileged jobs), so it
+# must stay visible to the traversal — see PATH_MANIFEST_MAP.
+HIDDEN_DIR_EXCEPTIONS = {".github"}
+
+# Path-level strong signals (relative to the scan root) -> language. Filename
+# matching in MANIFEST_MAP can't express a path constraint: a workflow YAML is
+# only a CI signal when it lives under .github/workflows/, not anywhere else.
+# CI workflow definitions are authorization code — which event triggered the
+# workflow, whose code runs, which secrets it can reach (absorbed from the CF
+# supply-chain audit reference) — so one hit is enough to include "iac".
+PATH_MANIFEST_MAP = {
+    os.path.join(".github", "workflows"): ("iac", (".yml", ".yaml")),
+}
+
 # extension-count threshold below which we treat a language as noise (e.g.
 # a single stray .py script in an otherwise all-Go repo isn't worth scanning)
 MIN_FILE_COUNT = 3
@@ -152,7 +168,13 @@ def detect(target: str, max_depth: int = 0):
                 dirs.clear()
                 continue
         try:
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+            dirs[:] = [
+                d
+                for d in dirs
+                if d not in SKIP_DIRS
+                and (not d.startswith(".") or d in HIDDEN_DIR_EXCEPTIONS)
+            ]
+            rel_dir = os.path.normpath(os.path.relpath(root, target))
             for fname in files:
                 if fname in MANIFEST_MAP:
                     strong.add(MANIFEST_MAP[fname])
@@ -160,6 +182,11 @@ def detect(target: str, max_depth: int = 0):
                 if ext in EXT_MAP:
                     lang = EXT_MAP[ext]
                     ext_counts[lang] = ext_counts.get(lang, 0) + 1
+                # Path-level strong signal — filename matching can't express
+                # the ".github/workflows/ prefix" constraint.
+                path_lang = PATH_MANIFEST_MAP.get(rel_dir)
+                if path_lang and ext in path_lang[1]:
+                    strong.add(path_lang[0])
         except PermissionError:
             # Skip directories we can't read — don't crash the whole scan.
             # The report will show "partial coverage" via the skipped tools

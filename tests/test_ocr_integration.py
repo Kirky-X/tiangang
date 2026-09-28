@@ -22,6 +22,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
@@ -447,6 +448,123 @@ class TestOcrDetectProjectType(unittest.TestCase):
             open(os.path.join(d, "package.json"), "w").close()
             bg = self._detect(d)
             self.assertIn("Rust", bg)
+
+
+# ===== OCR 安全背景预设（P2：按项目类型合并，--ocr-background 追加其后）=====
+
+
+class TestOcrSecurityPreset(unittest.TestCase):
+    """_OCR_SECURITY_PRESETS 覆盖与合并行为。"""
+
+    def test_presets_cover_all_kinds(self):
+        """每种项目类型都有非空预设。"""
+        import run_scan
+
+        for kind in ("rust", "go", "node", "python", "flutter", "generic"):
+            self.assertIn(kind, run_scan._OCR_SECURITY_PRESETS)
+            self.assertTrue(run_scan._OCR_SECURITY_PRESETS[kind].strip())
+
+    def test_presets_cover_four_hunting_dimensions(self):
+        """每个预设覆盖业务逻辑/认证/租户隔离/资源四维度。"""
+        import run_scan
+
+        for kind, preset in run_scan._OCR_SECURITY_PRESETS.items():
+            for dim in ("业务逻辑", "认证", "租户隔离", "资源"):
+                self.assertIn(dim, preset, f"{kind} 预设缺少维度: {dim}")
+
+    def test_project_kind_detection(self):
+        """_ocr_project_kind 与 manifest 优先级一致（Cargo.toml → go.mod →
+        package.json → requirements.txt/pyproject.toml → pubspec.yaml）。"""
+        import run_scan
+
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(run_scan._ocr_project_kind(d), "generic")
+        for manifest, kind in [
+            ("Cargo.toml", "rust"),
+            ("go.mod", "go"),
+            ("package.json", "node"),
+            ("requirements.txt", "python"),
+            ("pyproject.toml", "python"),
+            ("pubspec.yaml", "flutter"),
+        ]:
+            with tempfile.TemporaryDirectory() as d:
+                open(os.path.join(d, manifest), "w").close()
+                self.assertEqual(run_scan._ocr_project_kind(d), kind)
+
+    def test_kind_priority_rust_over_node(self):
+        """Cargo.toml 与 package.json 并存时 rust 优先（与语言背景同序）。"""
+        import run_scan
+
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "Cargo.toml"), "w").close()
+            open(os.path.join(d, "package.json"), "w").close()
+            self.assertEqual(run_scan._ocr_project_kind(d), "rust")
+
+    def _run_thunk_capturing_background(self, target, ocr_background=""):
+        """跑 _ocr_thunk 的 scan 路径（mock 掉环境与执行），捕获 --background。"""
+        import run_scan
+
+        captured = {}
+
+        def fake_run_tool(name, ran, cmd, **kwargs):
+            captured["cmd"] = cmd
+            ran.append(
+                {"tool": name, "command": " ".join(cmd), "returncode": 0, "log_tail": ""}
+            )
+
+        with tempfile.TemporaryDirectory() as out_dir:
+            with mock.patch("run_scan._ocr_setup_env", return_value=(True, None)), \
+                 mock.patch("run_scan.run_tool", side_effect=fake_run_tool), \
+                 mock.patch("run_scan._ocr_extract_session_findings", return_value=[]):
+                thunk = run_scan._ocr_thunk(
+                    target, out_dir, "scan", ocr_background=ocr_background
+                )
+                thunk()
+        return captured["cmd"]
+
+    def test_background_merges_preset_and_user_background_last(self):
+        """背景三层合并：语言背景 → 安全预设 → 用户 --ocr-background 在最后。"""
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "Cargo.toml"), "w").close()
+            cmd = self._run_thunk_capturing_background(d, ocr_background="focus auth")
+        bg = cmd[cmd.index("--background") + 1]
+        self.assertIn("Rust项目全维度深度审查", bg)
+        self.assertIn("业务逻辑", bg)
+        self.assertIn("整数溢出", bg)
+        self.assertIn("额外关注: focus auth", bg)
+        # 用户背景追加在安全预设（最后一个维度是 4.资源）之后
+        self.assertGreater(bg.index("额外关注"), bg.index("4.资源"))
+
+    def test_background_generic_preset_without_user_background(self):
+        """无 manifest 项目取 generic 预设；无 --ocr-background 时不追加'额外关注'。"""
+        with tempfile.TemporaryDirectory() as d:
+            cmd = self._run_thunk_capturing_background(d)
+        bg = cmd[cmd.index("--background") + 1]
+        self.assertIn("通用项目全维度深度审查", bg)
+        self.assertIn("业务逻辑", bg)
+        self.assertNotIn("额外关注", bg)
+
+    def test_background_preset_matches_detected_kind(self):
+        """node 项目合并 node 定制预设（原型污染），而非 generic。"""
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "package.json"), "w").close()
+            cmd = self._run_thunk_capturing_background(d)
+        bg = cmd[cmd.index("--background") + 1]
+        self.assertIn("原型污染", bg)
+        self.assertIn("Node.js/TypeScript项目全维度深度审查", bg)
+
+    def test_opt_in_boundary_preserved(self):
+        """预设只存在于 OCR 调用链内——不在自动调度的工具注册表中。"""
+        with open(
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "run_scan.py")
+        ) as f:
+            s = f.read()
+        self.assertIn("_OCR_SECURITY_PRESETS", s)
+        # 预设合并发生在 _ocr_thunk 内（仅 --ocr/--ocr-delegate 触发），
+        # 不出现在 _build_registry 的任何条目里。
+        registry_start = s.index("def _build_registry")
+        registry_end = s.index("def _dispatch_registry")
+        self.assertNotIn("_OCR_SECURITY_PRESETS", s[registry_start:registry_end])
 
 
 # ===== _ocr_setup_env =====
