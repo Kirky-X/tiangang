@@ -1,0 +1,36 @@
+rules:
+  - id: web-base-cors-wildcard-credentials
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "CORS 通配 origin + credentials:true 检测到。凭据型 CORS 必须精确 allowlist origin，禁止 Access-Control-Allow-Credentials 与通配 origin 组合（cf-security-audit ATTACK-CLASSES.md：通配 CORS）。"
+    pattern: 'cors({ ..., origin: "*", credentials: true, ... })'
+
+  - id: web-base-cors-reflected-origin-credentials
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "CORS 反射 origin（origin: true）+ credentials:true 检测到。任意源可携带受害者凭据跨源读写（cf-security-audit CLIENT-SIDE.md：Credentialed CORS trust）。"
+    pattern: 'cors({ ..., origin: true, credentials: true, ... })'
+
+  - id: web-base-cookie-missing-security-flags
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: "res.cookie 显式 options 缺 httpOnly/secure 检测到。会话 cookie 应设 httpOnly: true + secure: true，并按需收紧 SameSite/Domain/Path（cf-security-audit ATTACK-CLASSES.md：cookie 缺 HttpOnly/Secure/SameSite；WEB-PROTOCOL-AND-AUTH.md：Cookie scope and transport）。"
+    patterns:
+      - pattern: res.cookie($NAME, $VALUE, { ... })
+      - pattern-not: 'res.cookie($NAME, $VALUE, { ..., httpOnly: true, secure: true, ... })'
+      - pattern-not: 'res.cookie($NAME, $VALUE, { ..., secure: false, ... })'
+
+  - id: web-base-cookie-secure-false
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "res.cookie 显式 secure: false 检测到。cookie 可经明文 HTTP 传输被截获（cf-security-audit WEB-PROTOCOL-AND-AUTH.md：Cookie scope and transport）。"
+    pattern: 'res.cookie($NAME, $VALUE, { ..., secure: false, ... })'
+
+  - id: web-base-flask-cors-wildcard
+    languages: [python]
+    severity: WARNING
+    message: "flask_cors 通配 origins 检测到。应精确 allowlist origins；叠加 supports_credentials 时会放大为凭据泄露（cf-security-audit ATTACK-CLASSES.md：CORS headers set to *）。"
+    pattern-either:
+      - pattern: CORS($APP, origins="*")
+      - pattern: CORS($APP, origins=["*"])
+      - pattern: cross_origin(origins="*")

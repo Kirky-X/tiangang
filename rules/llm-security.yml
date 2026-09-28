@@ -1,0 +1,389 @@
+rules:
+  # LLM/Agent 安全 taint 规则集（AI-AND-LLM 攻击面的静态可判定子集）。
+  # source = LLM 调用返回值 / 检索或工具输出文本；sink = shell / 代码执行 / SQL / URL fetch / 文件路径 / 模板渲染 / HTML 渲染。
+  # action binding、confused deputy、MCP metadata 当策略等需要权限语义的攻击面无法 taint 化，刻意不成规则（见 references/llm-security-rules.md 注意事项）。
+
+  - id: llm-sec-output-to-shell
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: "LLM/检索输出流入 shell 执行 sink。验证是否用参数数组替代 shell=True 或 shlex.quote 收敛（AI-AND-LLM: Tool-argument injection）。"
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.invoke(...)
+              - pattern: $OBJ.run(...)
+              - pattern: $OBJ.generate(...)
+              - pattern: $OBJ.chat(...)
+              - pattern: $OBJ.complete(...)
+              - pattern: $OBJ.predict(...)
+              - pattern: $OBJ.create(...)
+              - pattern: $OBJ(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              # 只匹配 LLM/agent 相关命名，排除 os.system/subprocess 等普通调用
+              regex: "(?i)^.*(llm|agent|chain|model|client|completion|chat|gpt|claude|gemini|ollama|generator|assistant|bot|tool).*$"
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.get_relevant_documents(...)
+              - pattern: $OBJ.similarity_search(...)
+              - pattern: $OBJ.retrieve(...)
+              - pattern: $OBJ.search(...)
+              - pattern: $OBJ.query(...)
+              - pattern: $OBJ.fetch(...)
+              - pattern: $OBJ.run_tool(...)
+              - pattern: $OBJ.execute_tool(...)
+              - pattern: $OBJ.call_tool(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              # 检索/工具输出文本：RAG 文档、向量库、工具调用返回（AI-AND-LLM: Indirect injection）
+              regex: "(?i)^.*(retriev|vector|rag|knowledge|memory|search|index|scraper|reader|browser|web|mcp).*$"
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: os.system($CMD, ...)
+              - pattern: os.popen($CMD, ...)
+              - pattern: subprocess.getoutput($CMD, ...)
+              - pattern: subprocess.getstatusoutput($CMD, ...)
+          - focus-metavariable: $CMD
+      - patterns:
+          - pattern-either:
+              - pattern: subprocess.call($CMD, ..., shell=True, ...)
+              - pattern: subprocess.run($CMD, ..., shell=True, ...)
+              - pattern: subprocess.Popen($CMD, ..., shell=True, ...)
+              - pattern: subprocess.check_call($CMD, ..., shell=True, ...)
+              - pattern: subprocess.check_output($CMD, ..., shell=True, ...)
+          - focus-metavariable: $CMD
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: shlex.quote($X)
+          - pattern: int($X)
+          - pattern: float($X)
+
+  - id: llm-sec-output-to-code-exec
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: "LLM/检索输出流入 eval/exec/compile 动态执行 sink。模型输出不可作为代码执行，应解析为结构化输出（AI-AND-LLM: Tool-argument injection）。"
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.invoke(...)
+              - pattern: $OBJ.run(...)
+              - pattern: $OBJ.generate(...)
+              - pattern: $OBJ.chat(...)
+              - pattern: $OBJ.complete(...)
+              - pattern: $OBJ.predict(...)
+              - pattern: $OBJ.create(...)
+              - pattern: $OBJ(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(llm|agent|chain|model|client|completion|chat|gpt|claude|gemini|ollama|generator|assistant|bot|tool).*$"
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.get_relevant_documents(...)
+              - pattern: $OBJ.similarity_search(...)
+              - pattern: $OBJ.retrieve(...)
+              - pattern: $OBJ.search(...)
+              - pattern: $OBJ.query(...)
+              - pattern: $OBJ.fetch(...)
+              - pattern: $OBJ.run_tool(...)
+              - pattern: $OBJ.execute_tool(...)
+              - pattern: $OBJ.call_tool(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(retriev|vector|rag|knowledge|memory|search|index|scraper|reader|browser|web|mcp).*$"
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: eval($CODE, ...)
+              - pattern: exec($CODE, ...)
+              - pattern: compile($CODE, ...)
+          - focus-metavariable: $CODE
+
+  - id: llm-sec-output-to-sql
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: "LLM/检索输出流入 SQL execute sink。应改用参数化查询，模型输出拼进 SQL 串（含 f-string）视为注入（AI-AND-LLM: Tool-argument injection）。"
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.invoke(...)
+              - pattern: $OBJ.run(...)
+              - pattern: $OBJ.generate(...)
+              - pattern: $OBJ.chat(...)
+              - pattern: $OBJ.complete(...)
+              - pattern: $OBJ.predict(...)
+              - pattern: $OBJ.create(...)
+              - pattern: $OBJ(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(llm|agent|chain|model|client|completion|chat|gpt|claude|gemini|ollama|generator|assistant|bot|tool).*$"
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.get_relevant_documents(...)
+              - pattern: $OBJ.similarity_search(...)
+              - pattern: $OBJ.retrieve(...)
+              - pattern: $OBJ.search(...)
+              - pattern: $OBJ.query(...)
+              - pattern: $OBJ.fetch(...)
+              - pattern: $OBJ.run_tool(...)
+              - pattern: $OBJ.execute_tool(...)
+              - pattern: $OBJ.call_tool(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(retriev|vector|rag|knowledge|memory|search|index|scraper|reader|browser|web|mcp).*$"
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $CUR.execute($QUERY, ...)
+              - pattern: $CUR.executemany($QUERY, ...)
+              - pattern: $CUR.executescript($QUERY, ...)
+              - pattern: sqlalchemy.text($QUERY, ...)
+          - focus-metavariable: $QUERY
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: int($X)
+          - pattern: float($X)
+
+  - id: llm-sec-output-to-url-fetch
+    mode: taint
+    languages: [python]
+    severity: WARNING
+    message: "LLM/检索输出流入 URL fetch sink。验证是否有域名/协议白名单校验，防 SSRF 与内网探测（AI-AND-LLM: Tool-argument injection）。"
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.invoke(...)
+              - pattern: $OBJ.run(...)
+              - pattern: $OBJ.generate(...)
+              - pattern: $OBJ.chat(...)
+              - pattern: $OBJ.complete(...)
+              - pattern: $OBJ.predict(...)
+              - pattern: $OBJ.create(...)
+              - pattern: $OBJ(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(llm|agent|chain|model|client|completion|chat|gpt|claude|gemini|ollama|generator|assistant|bot|tool).*$"
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.get_relevant_documents(...)
+              - pattern: $OBJ.similarity_search(...)
+              - pattern: $OBJ.retrieve(...)
+              - pattern: $OBJ.search(...)
+              - pattern: $OBJ.query(...)
+              - pattern: $OBJ.fetch(...)
+              - pattern: $OBJ.run_tool(...)
+              - pattern: $OBJ.execute_tool(...)
+              - pattern: $OBJ.call_tool(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(retriev|vector|rag|knowledge|memory|search|index|scraper|reader|browser|web|mcp).*$"
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: requests.get($URL, ...)
+              - pattern: requests.post($URL, ...)
+              - pattern: requests.put($URL, ...)
+              - pattern: requests.patch($URL, ...)
+              - pattern: requests.delete($URL, ...)
+              - pattern: requests.head($URL, ...)
+              - pattern: requests.options($URL, ...)
+              - pattern: requests.request($METHOD, $URL, ...)
+              - pattern: urllib.request.urlopen($URL, ...)
+              - pattern: urlopen($URL, ...)
+              - pattern: httpx.get($URL, ...)
+              - pattern: httpx.post($URL, ...)
+              - pattern: httpx.request($METHOD, $URL, ...)
+          - focus-metavariable: $URL
+
+  - id: llm-sec-output-to-file-write
+    mode: taint
+    languages: [python]
+    severity: WARNING
+    message: "LLM/检索输出流入写模式文件路径 sink。验证 handler 是否校验路径白名单/目录约束，防任意路径写入（AI-AND-LLM: Tool-argument injection）。"
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.invoke(...)
+              - pattern: $OBJ.run(...)
+              - pattern: $OBJ.generate(...)
+              - pattern: $OBJ.chat(...)
+              - pattern: $OBJ.complete(...)
+              - pattern: $OBJ.predict(...)
+              - pattern: $OBJ.create(...)
+              - pattern: $OBJ(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(llm|agent|chain|model|client|completion|chat|gpt|claude|gemini|ollama|generator|assistant|bot|tool).*$"
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.get_relevant_documents(...)
+              - pattern: $OBJ.similarity_search(...)
+              - pattern: $OBJ.retrieve(...)
+              - pattern: $OBJ.search(...)
+              - pattern: $OBJ.query(...)
+              - pattern: $OBJ.fetch(...)
+              - pattern: $OBJ.run_tool(...)
+              - pattern: $OBJ.execute_tool(...)
+              - pattern: $OBJ.call_tool(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(retriev|vector|rag|knowledge|memory|search|index|scraper|reader|browser|web|mcp).*$"
+    pattern-sinks:
+      - patterns:
+          - pattern: open($PATH, $MODE, ...)
+          - metavariable-regex:
+              metavariable: $MODE
+              # 只匹配写/追加/创建模式；只读路径不在本规则范围
+              regex: "['\"][wax+]"
+          - focus-metavariable: $PATH
+      - patterns:
+          - pattern: open($PATH, ..., mode=$MODE, ...)
+          - metavariable-regex:
+              metavariable: $MODE
+              regex: "['\"][wax+]"
+          - focus-metavariable: $PATH
+
+  - id: llm-sec-output-to-template-render
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: "LLM/检索输出流入模板字符串渲染 sink（SSTI）。模板串必须静态，动态内容走变量参数（AI-AND-LLM: Insecure output rendering）。"
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.invoke(...)
+              - pattern: $OBJ.run(...)
+              - pattern: $OBJ.generate(...)
+              - pattern: $OBJ.chat(...)
+              - pattern: $OBJ.complete(...)
+              - pattern: $OBJ.predict(...)
+              - pattern: $OBJ.create(...)
+              - pattern: $OBJ(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(llm|agent|chain|model|client|completion|chat|gpt|claude|gemini|ollama|generator|assistant|bot|tool).*$"
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.get_relevant_documents(...)
+              - pattern: $OBJ.similarity_search(...)
+              - pattern: $OBJ.retrieve(...)
+              - pattern: $OBJ.search(...)
+              - pattern: $OBJ.query(...)
+              - pattern: $OBJ.fetch(...)
+              - pattern: $OBJ.run_tool(...)
+              - pattern: $OBJ.execute_tool(...)
+              - pattern: $OBJ.call_tool(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(retriev|vector|rag|knowledge|memory|search|index|scraper|reader|browser|web|mcp).*$"
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: render_template_string($TPL, ...)
+              - pattern: flask.render_template_string($TPL, ...)
+              - pattern: $ENV.from_string($TPL)
+              - pattern: Template($TPL, ...)
+          - focus-metavariable: $TPL
+
+  - id: llm-sec-output-to-html-render
+    mode: taint
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "LLM/检索输出流入 HTML 渲染 sink（XSS）。默认用 textContent/框架转义，富文本必须过 DOMPurify（AI-AND-LLM: Insecure output rendering）。"
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.invoke(...)
+              - pattern: $OBJ.run(...)
+              - pattern: $OBJ.generate(...)
+              - pattern: $OBJ.chat(...)
+              - pattern: $OBJ.complete(...)
+              - pattern: $OBJ.predict(...)
+              - pattern: $OBJ.create(...)
+              - pattern: $OBJ(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(llm|agent|chain|model|client|completion|chat|gpt|claude|gemini|ollama|generator|assistant|bot|tool).*$"
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.get_relevant_documents(...)
+              - pattern: $OBJ.similarity_search(...)
+              - pattern: $OBJ.retrieve(...)
+              - pattern: $OBJ.search(...)
+              - pattern: $OBJ.query(...)
+              - pattern: $OBJ.fetch(...)
+              - pattern: $OBJ.run_tool(...)
+              - pattern: $OBJ.execute_tool(...)
+              - pattern: $OBJ.call_tool(...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(retriev|vector|rag|knowledge|memory|search|index|scraper|reader|browser|web|mcp).*$"
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $EL.innerHTML = $HTML
+              - pattern: $EL.outerHTML = $HTML
+              - pattern: document.write($HTML)
+              - pattern: document.writeln($HTML)
+              - pattern: $EL.insertAdjacentHTML($POS, $HTML)
+          - focus-metavariable: $HTML
+      - patterns:
+          - pattern: "{ __html: $HTML }"
+          - focus-metavariable: $HTML
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: DOMPurify.sanitize($X)
+          - pattern: sanitizeHtml($X)
+
+  - id: llm-sec-prompt-concat-signal
+    languages: [python]
+    severity: WARNING
+    message: "调用点拼接动态内容进 LLM prompt（间接注入/来源混淆信号）。验证拼接内容是否保留来源标注与定界符、系统指令是否可被覆盖（AI-AND-LLM: Prompt role and provenance confusion；弱信号，由审核者验证）。"
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.invoke($PROMPT, ...)
+              - pattern: $OBJ.run($PROMPT, ...)
+              - pattern: $OBJ.generate($PROMPT, ...)
+              - pattern: $OBJ.chat($PROMPT, ...)
+              - pattern: $OBJ.complete($PROMPT, ...)
+              - pattern: $OBJ.predict($PROMPT, ...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(llm|agent|chain|model|client|completion|chat|gpt|claude|gemini|ollama|generator|assistant|bot|tool).*$"
+          - metavariable-pattern:
+              metavariable: $PROMPT
+              pattern-either:
+                # f-string / + 拼接 / format / % 四种调用点拼接形态
+                - pattern: 'f"...{$X}..."'
+                - pattern: $A + $B
+                - pattern: $S.format(...)
+                - pattern: $A % $B
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ.invoke(..., prompt=$PROMPT, ...)
+              - pattern: $OBJ.run(..., prompt=$PROMPT, ...)
+              - pattern: $OBJ.generate(..., prompt=$PROMPT, ...)
+              - pattern: $OBJ.complete(..., prompt=$PROMPT, ...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(llm|agent|chain|model|client|completion|chat|gpt|claude|gemini|ollama|generator|assistant|bot|tool).*$"
+          - metavariable-pattern:
+              metavariable: $PROMPT
+              pattern-either:
+                - pattern: 'f"...{$X}..."'
+                - pattern: $A + $B
+                - pattern: $S.format(...)
+                - pattern: $A % $B
+      - patterns:
+          - pattern: $OBJ.create(..., messages=$MSGS, ...)
+          - metavariable-regex:
+              metavariable: $OBJ
+              regex: "(?i)^.*(llm|agent|chain|model|client|completion|chat|gpt|claude|gemini|ollama|generator|assistant|bot|tool).*$"
+          - metavariable-pattern:
+              metavariable: $MSGS
+              # 深度匹配 messages 结构里任意位置的 f-string 插值
+              pattern: <... f"...{$X}..." ...>
