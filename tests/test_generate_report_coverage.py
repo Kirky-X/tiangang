@@ -1808,5 +1808,256 @@ class TestScriptEntryPoint(unittest.TestCase):
             self.assertIn("report written to", result.stdout)
 
 
+class TestTriagePromptThreeStateVerdict(unittest.TestCase):
+    """generate_triage_prompt 三态 verdict：true_positive/false_positive/needs_validation。"""
+
+    def _finding(self):
+        return {
+            "severity": "high",
+            "tool": "semgrep",
+            "rule": "sql-injection",
+            "file": "db.py",
+            "line": "42",
+            "message": "SQL injection",
+        }
+
+    def test_verdict_enum_contains_three_states(self):
+        """响应格式的 verdict 枚举应含三态，旧的二值枚举不再出现。"""
+        import generate_report
+        prompt = generate_report.generate_triage_prompt([self._finding()])
+        self.assertIn(
+            '"verdict": "true_positive|false_positive|needs_validation"', prompt
+        )
+        # 带闭合引号的二值枚举是旧格式的精确形态——三态枚举内含 false_positive|，
+        # 因此该断言不会误命中新枚举。
+        self.assertNotIn('"verdict": "true_positive|false_positive"', prompt)
+
+    def test_response_format_backward_compatible(self):
+        """响应格式应保留 index/confidence/reasoning 基础字段（解析方是调用 agent）。"""
+        import generate_report
+        prompt = generate_report.generate_triage_prompt([self._finding()])
+        self.assertIn('"index": 0', prompt)
+        self.assertIn('"confidence": "high|medium|low"', prompt)
+        self.assertIn('"reasoning"', prompt)
+
+    def test_needs_validation_forbidden_severity(self):
+        """needs_validation 不得定严重级：severity 仅允许出现在 true_positive 上。"""
+        import generate_report
+        prompt = generate_report.generate_triage_prompt([self._finding()])
+        self.assertIn('"severity" belongs on true_positive entries only', prompt)
+        self.assertIn("needs_validation entries must NOT include it", prompt)
+        self.assertIn("needs_validation must NOT carry a severity field", prompt)
+
+    def test_anti_escalation_discipline_present(self):
+        """反拔高纪律：crash≠代码执行、缺最佳实践≠漏洞、flag 不是 finding（先 trace）。"""
+        import generate_report
+        prompt = generate_report.generate_triage_prompt([self._finding()])
+        self.assertIn("A flag is not a finding", prompt)
+        self.assertIn("Do not strengthen a crash into code execution", prompt)
+        self.assertIn("A missing best practice", prompt)
+
+    def test_severity_anchors_and_impact_cap(self):
+        """严重度锚点：完全击穿 vs 仅削弱判据存在，severity 不超过已证明影响。"""
+        import generate_report
+        prompt = generate_report.generate_triage_prompt([self._finding()])
+        self.assertIn("exceed the demonstrated impact", prompt)
+        self.assertIn("only weaken it (medium)", prompt)
+        for anchor in ("critical", "high", "medium", "low", "info"):
+            self.assertIn(f"- {anchor} —", prompt)
+
+
+class TestCoverageByDomain(unittest.TestCase):
+    """coverage_by_domain：纯确定性查表，covered/partial/not covered 判定。"""
+
+    def _entry(self, entries, domain):
+        return {e["domain"]: e for e in entries}[domain]
+
+    def test_all_tools_ran_clean_is_covered(self):
+        """域内全部工具 ran 且退出码 0 → covered。"""
+        import generate_report
+        manifest = {
+            "ran": [
+                {"tool": "checkov", "returncode": 0},
+                {"tool": "tfsec", "returncode": 0},
+            ]
+        }
+        entry = self._entry(
+            generate_report.coverage_by_domain(manifest), "cloud-deployment"
+        )
+        self.assertEqual(entry["status"], "covered")
+        self.assertEqual(entry["tools_ran"], ["checkov", "tfsec"])
+
+    def test_some_tools_ran_is_partial(self):
+        """部分工具 ran、其余 skipped → partial，tools_ran 只含 ran 的。"""
+        import generate_report
+        manifest = {
+            "ran": [{"tool": "checkov", "returncode": 0}],
+            "skipped": [{"tool": "tfsec", "reason": "not installed"}],
+        }
+        entry = self._entry(
+            generate_report.coverage_by_domain(manifest), "cloud-deployment"
+        )
+        self.assertEqual(entry["status"], "partial")
+        self.assertEqual(entry["tools_ran"], ["checkov"])
+
+    def test_skipped_only_is_not_covered(self):
+        """域内工具全部 skipped → not covered。"""
+        import generate_report
+        manifest = {
+            "skipped": [
+                {"tool": "checkov", "reason": "not installed"},
+                {"tool": "tfsec", "reason": "not installed"},
+            ]
+        }
+        entry = self._entry(
+            generate_report.coverage_by_domain(manifest), "cloud-deployment"
+        )
+        self.assertEqual(entry["status"], "not covered")
+        self.assertEqual(entry["tools_ran"], [])
+
+    def test_failed_tool_does_not_count_as_coverage(self):
+        """ran 但退出码非 0 不算覆盖（与 failed-tools 小节同一语义：覆盖缺失）。"""
+        import generate_report
+        both_failed = {
+            "ran": [
+                {"tool": "checkov", "returncode": 1},
+                {"tool": "tfsec", "returncode": -1},
+            ]
+        }
+        entry = self._entry(
+            generate_report.coverage_by_domain(both_failed), "cloud-deployment"
+        )
+        self.assertEqual(entry["status"], "not covered")
+        one_ok = {
+            "ran": [
+                {"tool": "checkov", "returncode": 2, "log_tail": "panic"},
+                {"tool": "tfsec", "returncode": 0},
+            ]
+        }
+        entry = self._entry(
+            generate_report.coverage_by_domain(one_ok), "cloud-deployment"
+        )
+        self.assertEqual(entry["status"], "partial")
+
+    def test_empty_manifest_all_not_covered(self):
+        """空 manifest（扫描未跑）→ 所有域 not covered，不抛异常。"""
+        import generate_report
+        entries = generate_report.coverage_by_domain({})
+        self.assertEqual(len(entries), len(generate_report.COVERAGE_MAP))
+        self.assertTrue(all(e["status"] == "not covered" for e in entries))
+
+    def test_channel_less_domain_always_not_covered(self):
+        """无专属通道的域（resource-exhaustion）即使全部工具都 ran 也保持 not covered。"""
+        import generate_report
+        all_tools = [
+            t for d in generate_report.COVERAGE_MAP for t in d["tools"]
+        ] + ["ocr", "semgrep-agent"]
+        manifest = {"ran": [{"tool": t, "returncode": 0} for t in all_tools]}
+        entry = self._entry(
+            generate_report.coverage_by_domain(manifest), "resource-exhaustion"
+        )
+        self.assertEqual(entry["status"], "not covered")
+
+    def test_same_manifest_yields_identical_labels(self):
+        """同一 manifest 两次查表结果完全一致（确定性）。"""
+        import generate_report
+        manifest = {
+            "ran": [{"tool": "bandit", "returncode": 0}],
+            "skipped": [{"tool": "checkov", "reason": "not installed"}],
+        }
+        self.assertEqual(
+            generate_report.coverage_by_domain(manifest),
+            generate_report.coverage_by_domain(manifest),
+        )
+
+    def test_stub_map_status_boundaries(self):
+        """mock 换桩表隔离验证状态判定边界：全 ran / 部分 ran / 全缺。"""
+        import generate_report
+        stub = [
+            {"domain": "d1", "label": "D1", "reference": "X.md", "tools": ["a", "b"]},
+            {"domain": "d2", "label": "D2", "reference": "Y.md", "tools": []},
+        ]
+        manifest = {"ran": [{"tool": "a", "returncode": 0}]}
+        with mock.patch.object(generate_report, "COVERAGE_MAP", stub):
+            entries = generate_report.coverage_by_domain(manifest)
+        self.assertEqual(entries[0]["status"], "partial")
+        self.assertEqual(entries[1]["status"], "not covered")
+
+
+class TestRenderCoverageSection(unittest.TestCase):
+    """render_report 的 Attack surface coverage 小节：位置与确定性标注。"""
+
+    def _manifest(self):
+        return {
+            "target": "/test",
+            "languages": ["python"],
+            "timestamp": "2024-01-01",
+            "ran": [
+                {"tool": "bandit", "returncode": 0},
+                {"tool": "semgrep", "returncode": 0},
+            ],
+            "skipped": [{"tool": "checkov", "reason": "not installed"}],
+        }
+
+    def test_section_rendered_after_tool_summary(self):
+        """小节应出现在工具汇总（Tools not run）之后、Findings 之前。"""
+        import generate_report
+        findings = [
+            {
+                "tool": "bandit",
+                "rule": "B608",
+                "severity": "high",
+                "file": "db.py",
+                "line": "10",
+                "message": "SQL injection",
+            }
+        ]
+        report = generate_report.render_report(
+            "/test", findings, [], self._manifest()
+        )
+        self.assertIn("## Attack surface coverage", report)
+        self.assertLess(
+            report.index("## Tools not run"),
+            report.index("## Attack surface coverage"),
+        )
+        self.assertLess(
+            report.index("## Attack surface coverage"),
+            report.index("## Findings"),
+        )
+
+    def test_deterministic_labels_for_given_manifest(self):
+        """给定 manifest 输出确定的 covered/未覆盖标注，且两次渲染一致。"""
+        import generate_report
+        report = generate_report.render_report("/test", [], [], self._manifest())
+        # 普通攻击类：13 个通道只有 semgrep/bandit ran → partial
+        self.assertIn(
+            "| Ordinary classes | ATTACK-CLASSES.md | partial | semgrep, bandit |",
+            report,
+        )
+        # 云与部署：checkov skipped、tfsec 未跑 → not covered
+        self.assertIn(
+            "| Cloud & deployment | CLOUD-AND-DEPLOYMENT.md | not covered | (none) |",
+            report,
+        )
+        # 无专属通道的域恒为 not covered
+        self.assertIn(
+            "| Resource exhaustion & availability | "
+            "RESOURCE-EXHAUSTION-AND-AVAILABILITY.md | not covered | (none) |",
+            report,
+        )
+        self.assertNotIn(
+            "| Cloud & deployment | CLOUD-AND-DEPLOYMENT.md | covered |", report
+        )
+        again = generate_report.render_report("/test", [], [], self._manifest())
+        self.assertEqual(report, again)
+
+    def test_section_present_even_without_manifest(self):
+        """无 manifest 时小节仍渲染（全域 not covered），不抛异常。"""
+        import generate_report
+        report = generate_report.render_report("/test", [], [], {})
+        self.assertIn("## Attack surface coverage", report)
+        self.assertEqual(report.count("| not covered |"), 11)
+
+
 if __name__ == "__main__":
     unittest.main()

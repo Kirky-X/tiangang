@@ -981,6 +981,176 @@ def collect_findings(results_dir):
     return deduped, parse_errors
 
 
+# Attack-surface coverage map: static domain → detection-channel mapping,
+# distilled from the cf-security-audit-skill 12-domain classification. The
+# human-readable table (one 归属 note per domain) lives in
+# references/coverage-map.md — keep the two in sync. Tool names match the
+# ``tool`` field of scan_manifest.json's ran/skipped entries exactly (the
+# names run_scan.py registers). The lookup is purely deterministic (see
+# coverage_by_domain): no model is called, and the same manifest always
+# yields the same labels. The validation-reporting domain is reporting-layer
+# discipline (the three-state --triage verdict), has no tool channel, and is
+# deliberately not part of this table.
+COVERAGE_MAP = [
+    {
+        "domain": "ordinary-classes",
+        "label": "Ordinary classes",
+        "reference": "ATTACK-CLASSES.md",
+        "tools": [
+            "semgrep",
+            "bandit",
+            "gosec",
+            "flawfinder",
+            "cppcheck",
+            "brakeman",
+            "psalm",
+            "findsecbugs",
+            "security-code-scan",
+            "njsscan",
+            "eslint-security",
+            "gitleaks",
+            "trufflehog",
+        ],
+    },
+    {
+        "domain": "memory-safety-binary",
+        "label": "Memory safety & binary",
+        "reference": "MEMORY-SAFETY-AND-BINARY.md",
+        "tools": ["flawfinder", "cppcheck", "miri", "codeql"],
+    },
+    {
+        "domain": "ai-llm-agent",
+        "label": "AI / LLM / agent",
+        "reference": "AI-AND-LLM.md",
+        "tools": ["semgrep-agent", "ocr"],
+    },
+    {
+        "domain": "web-protocol-auth",
+        "label": "Web protocol & auth",
+        "reference": "WEB-PROTOCOL-AND-AUTH.md",
+        "tools": [
+            "semgrep",
+            "brakeman",
+            "psalm",
+            "findsecbugs",
+            "njsscan",
+            "eslint-security",
+        ],
+    },
+    {
+        "domain": "client-side",
+        "label": "Client-side",
+        "reference": "CLIENT-SIDE.md",
+        "tools": ["eslint-security", "retire", "semgrep"],
+    },
+    {
+        "domain": "supply-chain-release",
+        "label": "Supply chain & release",
+        "reference": "SUPPLY-CHAIN-AND-RELEASE.md",
+        "tools": ["trivy", "cargo-audit", "retire", "gitleaks", "trufflehog"],
+    },
+    {
+        "domain": "cloud-deployment",
+        "label": "Cloud & deployment",
+        "reference": "CLOUD-AND-DEPLOYMENT.md",
+        "tools": ["checkov", "tfsec"],
+    },
+    {
+        "domain": "protocols-rpc-messaging",
+        "label": "Protocols, RPC & messaging",
+        "reference": "PROTOCOLS-RPC-AND-MESSAGING.md",
+        "tools": ["semgrep", "findsecbugs", "gosec"],
+    },
+    {
+        # No dedicated static channel in tiangang — always surfaces as a gap
+        # so the report never implies "rest is fine".
+        "domain": "resource-exhaustion",
+        "label": "Resource exhaustion & availability",
+        "reference": "RESOURCE-EXHAUSTION-AND-AVAILABILITY.md",
+        "tools": [],
+    },
+    {
+        "domain": "data-isolation-lifecycle",
+        "label": "Data isolation & lifecycle",
+        "reference": "DATA-ISOLATION-AND-LIFECYCLE.md",
+        "tools": ["semgrep", "brakeman", "psalm", "findsecbugs"],
+    },
+    {
+        # No dedicated static channel in tiangang — always surfaces as a gap.
+        "domain": "desktop-mobile-local-ipc",
+        "label": "Desktop, mobile & local IPC",
+        "reference": "DESKTOP-MOBILE-AND-LOCAL-IPC.md",
+        "tools": [],
+    },
+]
+
+
+def coverage_by_domain(manifest):
+    """Look COVERAGE_MAP up against the scan manifest. Purely deterministic.
+
+    A mapped tool counts as coverage only when it appears in ``ran`` with
+    returncode 0 — the same rule the failed-tools section applies (a tool
+    that exited non-zero has no coverage in the findings). Skipped, failed,
+    and never-invoked tools all count as missing.
+
+    Returns one entry per map domain, in map order:
+      {domain, label, reference, status, tools_ran}
+    where status is "covered" (every mapped tool ran cleanly), "partial"
+    (some did), or "not covered" (none did — including domains with no
+    mapped channel at all).
+    """
+    ran_ok = {
+        r.get("tool")
+        for r in manifest.get("ran", [])
+        if isinstance(r, dict) and r.get("returncode", 0) == 0
+    }
+    entries = []
+    for d in COVERAGE_MAP:
+        tools_ran = [t for t in d["tools"] if t in ran_ok]
+        if d["tools"] and len(tools_ran) == len(d["tools"]):
+            status = "covered"
+        elif tools_ran:
+            status = "partial"
+        else:
+            status = "not covered"
+        entries.append(
+            {
+                "domain": d["domain"],
+                "label": d["label"],
+                "reference": d["reference"],
+                "status": status,
+                "tools_ran": tools_ran,
+            }
+        )
+    return entries
+
+
+def render_coverage_section(manifest):
+    """Render the per-domain attack-surface coverage section (Markdown).
+
+    Emitted after the tool summary sections. The mapping is the static
+    COVERAGE_MAP (references/coverage-map.md) — no model is involved, so
+    the same manifest always renders the same labels.
+    """
+    lines = [
+        "## Attack surface coverage",
+        "",
+        "Static mapping of attack domains (references/coverage-map.md) to the",
+        "channels in this scan. `covered` = every mapped tool ran cleanly;",
+        "`partial` = some did; `not covered` = none did. A domain without",
+        "coverage means the findings elsewhere do not imply safety there — the",
+        "scan had no channel for it.",
+        "",
+        "| Domain | Reference | Status | Tools ran |",
+        "|---|---|---|---|",
+    ]
+    for e in coverage_by_domain(manifest):
+        ran = ", ".join(e["tools_ran"]) if e["tools_ran"] else "(none)"
+        lines.append(f"| {e['label']} | {e['reference']} | {e['status']} | {ran} |")
+    lines.append("")
+    return lines
+
+
 def render_report(results_dir, findings, parse_errors, manifest):
     lines = ["# Security audit report", ""]
     lines.append(f"Target: `{manifest.get('target', results_dir)}`  ")
@@ -1034,6 +1204,10 @@ def render_report(results_dir, findings, parse_errors, manifest):
                 f"- **{r['tool']}** (exit {r['returncode']}): {tail[-300:] if tail else '(no output)'}"
             )
         lines.append("")
+
+    # Attack-surface coverage: deterministic per-domain lookup over the same
+    # manifest data (map: references/coverage-map.md). No model involved.
+    lines.extend(render_coverage_section(manifest))
 
     if parse_errors:
         lines.append("## Parse errors")
@@ -1347,12 +1521,20 @@ MAX_TRIAGE_SNIPPETS = 100
 
 
 def generate_triage_prompt(findings, context=None):
-    """Generate an LLM prompt for triaging findings as true/false positives.
+    """Generate an LLM prompt for triaging findings with a three-state verdict.
 
-    The prompt asks the LLM to assess each finding's likelihood of being a
-    true positive based on the code context. Findings confirmed by multiple
-    tools are highlighted as higher-confidence. The output is a JSON array
-    of {finding_idx, verdict, confidence, reasoning} objects.
+    The prompt asks the LLM to classify each finding as true_positive,
+    false_positive, or needs_validation (source supports the claim but a
+    decisive fact is not visible in the code). It carries an anti-escalation
+    discipline — a flag is not a finding (trace the impact first), a crash is
+    not strengthened into code execution, a missing best practice with no
+    affected principal/resource is hardening, not a vulnerability — and
+    severity anchors that apply to true_positive entries only: a
+    needs_validation entry never gets a severity, and severity cannot exceed
+    the demonstrated impact. Findings confirmed by multiple tools are
+    highlighted as higher-confidence. The output is a JSON array of
+    {index, verdict, confidence, reasoning} objects; ``severity`` is an
+    additional optional field valid on true_positive entries only.
 
     This is a deterministic prompt generator — the LLM itself does the
     classification. The prompt is structured so the LLM's response can be
@@ -1369,7 +1551,25 @@ def generate_triage_prompt(findings, context=None):
     has_snippets_capable = bool(context)
     lines = [
         "You are a security analyst triaging SAST findings. For each finding below,",
-        "assess whether it is likely a TRUE POSITIVE or FALSE POSITIVE.",
+        "assign exactly one verdict:",
+        "- true_positive — the code path is reachable and the claimed impact holds",
+        "  as stated, with no source-visible preventing layer.",
+        "- false_positive — source evidence refutes the claim (unreachable path,",
+        "  existing sanitization, test/dead code, or intended behavior).",
+        "- needs_validation — the source supports the claim but a decisive fact is",
+        "  not visible in the code (deployment config, runtime environment, or",
+        "  external service). Name the exact missing fact in the reasoning.",
+        "",
+        "Evidence discipline (applies to every verdict):",
+        "- A flag is not a finding — trace the impact first. The trace must start",
+        "  at a real entry point and end at the claimed sink.",
+        "- Do not strengthen a crash into code execution, ordinary work into",
+        "  shared availability, or a same-principal action into privilege gain.",
+        "- A missing best practice with no affected principal/resource is",
+        "  hardening, not a vulnerability — verdict false_positive.",
+        "- A claim disproved by source is false_positive, never needs_validation.",
+        "- needs_validation must NOT carry a severity field, and its reasoning",
+        "  must not speculate the value of the missing fact.",
         "",
         "Consider:",
         "- Is the code path actually reachable?",
@@ -1381,8 +1581,27 @@ def generate_triage_prompt(findings, context=None):
         "  source. Findings marked 'no code context' must get only a PRELIMINARY",
         "  assessment based on the metadata, with confidence lowered accordingly.",
         "",
+        "Severity anchors (for true_positive entries only; overall severity cannot",
+        "exceed the demonstrated impact):",
+        "- critical — an unauthenticated actor gains code execution, full",
+        "  data-store access, or takeover of arbitrary accounts.",
+        "- high — an explicit security control is fully defeated with real",
+        "  consequences: authentication bypass, cross-tenant read/write, stored",
+        "  script execution affecting other users, authenticated code execution.",
+        "- medium — a real boundary violation with limited blast radius, uncommon",
+        "  preconditions, or consequences confined to a narrow resource set.",
+        "- low — disclosure of non-secret internals, or an effect requiring",
+        "  sustained effort for minimal gain.",
+        "- info — confirmed but minimal-impact observation.",
+        "- The high/medium discriminator: does the demonstrated result fully defeat",
+        "  the control (high) or only weaken it (medium)? If you cannot state the",
+        "  concrete damage, the severity is lower than it feels.",
+        "",
         "Respond with a JSON array of objects:",
-        '[{"index": 0, "verdict": "true_positive|false_positive", "confidence": "high|medium|low", "reasoning": "..."}]',
+        '[{"index": 0, "verdict": "true_positive|false_positive|needs_validation", "confidence": "high|medium|low", "reasoning": "...", "severity": "critical|high|medium|low|info"}]',
+        "\"severity\" belongs on true_positive entries only; false_positive and",
+        "needs_validation entries must NOT include it. Verdicts other than the",
+        "three listed are invalid.",
         "",
         "Findings:",
     ]
