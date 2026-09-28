@@ -73,7 +73,7 @@ python3 scripts/run_scan.py <target-dir> --diff-only --since HEAD~1
 
 **SCA DB 陈旧信号**:trivy 在 DB 过期时返回零结果,而零结果在 DB 过期时是可疑信号而非"安全"。`run_scan.py` 把 `trivy version --format json` 写入 `trivy-version.json`,让 `VulnerabilityDB.UpdatedAt` 成为可见信号,报告可显式标注是否需要 `trivy db update`。
 
-对于实现 LLM agent 的代码库（LangChain、CrewAI、AutoGen、langgraph 等），在 `--config auto` 之外加载 agent 反模式 Semgrep 规则集，把 12-factor-agents 架构违规作为 SAST 信号捕获——规则说明见 `references/agent-semgrep-rules.md`，物化后的规则文件位于 `rules/agent-antipatterns.yml`。`run_scan.py` 支持 `--agent-rules` 开关自动加载该规则集，所以当目标看起来像 agent 代码时加上该开关即可，或单独跑一次 Semgrep。
+对于实现 LLM agent 的代码库（LangChain、CrewAI、AutoGen、langgraph 等），在 `--config auto` 之外加载 agent 反模式 Semgrep 规则集，把 12-factor-agents 架构违规作为 SAST 信号捕获——规则说明见 `references/agent-semgrep-rules.md`，物化后的规则文件位于 `rules/agent-antipatterns.yml`。`run_scan.py` 支持 `--agent-rules` 开关自动加载该规则集，并在同一遍 agent 扫描中并列加载 `rules/llm-security.yml`（LLM/agent 输出流入 shell/eval/SQL/URL/文件/模板/HTML 的 taint 规则，见 `references/llm-security-rules.md`），所以当目标看起来像 agent 代码时加上该开关即可，或单独跑一次 Semgrep。
 
 **这一步不运行 CodeQL。** CodeQL 需要先构建编译后的查询数据库，明显更慢——把它当作 opt-in 的深度扫描。如果用户要求"深度"或"彻底"审计，或明确点名 CodeQL，读 `references/codeql.md` 并单独运行那个流程，在生成报告前把它的 SARIF 输出写入同一个 results 目录。
 
@@ -83,11 +83,11 @@ python3 scripts/run_scan.py <target-dir> --diff-only --since HEAD~1
 python3 scripts/generate_report.py <results-dir> [--out report.md] [--format md|html|json|all]
 # 包含趋势对比
 python3 scripts/generate_report.py <results-dir> --trend
-# 生成 LLM 误报过滤提示词
+# 生成三态裁决提示词（true_positive/false_positive/needs_validation）
 python3 scripts/generate_report.py <results-dir> --triage
 ```
 
-解析 results 目录中的每个原始工具输出（SARIF、Bandit JSON、Cppcheck XML、cargo-audit JSON、Trivy/Gitleaks/Trufflehog/Retire JSON/JSONL——如果接入新工具，扩展脚本中的 `PARSERS`），汇总成一份 Markdown 报告：按严重程度的汇总表、未运行工具的列表及原因、按严重程度再按文件分组的发现。把这份文件作为交付物呈现给用户——不要把原始工具输出粘到对话里，这一步的全部意义就是把五种工具各自奇奇怪怪的格式变成人类能读的一份东西。
+解析 results 目录中的每个原始工具输出（SARIF、Bandit JSON、Cppcheck XML、cargo-audit JSON、Trivy/Gitleaks/Trufflehog/Retire JSON/JSONL——如果接入新工具，扩展脚本中的 `PARSERS`），汇总成一份 Markdown 报告：按严重程度的汇总表、未运行工具的列表及原因、按 `references/coverage-map.md` 静态查表产出的逐域攻击面覆盖（`## Attack surface coverage`：每域 covered/partial/not covered，不调用模型）、按严重程度再按文件分组的发现。把这份文件作为交付物呈现给用户——不要把原始工具输出粘到对话里，这一步的全部意义就是把五种工具各自奇奇怪怪的格式变成人类能读的一份东西。
 
 **密钥扫描输出的 secret-on-disk 防护**:gitleaks 的 `Secret`/`Match`、trufflehog 的 `Raw`/`Redacted` 字段携带凭证原文。`generate_report.py` 的 parser 在 message 中只保留 rule id / detector name / verified 标志,**绝不**把凭证原文写入报告 —— `redact.py` 的通用正则脱敏是 defense in depth,parser 层是第一道防线。这是一个 P0 安全要求:安全工具自身的输出不能成为 secret-on-disk 的载体。`run_scan.py` 在扫描流水线收尾时会对 results 目录中的原始 JSON/JSONL 输出做原位脱敏；仍应把 results 目录视为敏感物——不要把它拷进报告、日志或提交到 git，扫描完成后可整目录删除。
 
@@ -141,4 +141,4 @@ git diff <merge-base>..<to> -- <path>
 
 - `references/tools.md` — 每种语言的工具、检测信号、安装命令、扫描命令、输出格式完整表。在脚本未处理的手动安装或调用任何工具前读这个，或当脚本的安装/扫描命令需要针对用户特定环境调整时（例如没有 `apt`、有代理、气隙机）。
 - `references/codeql.md` — 独立、更重的 CodeQL 流程：CLI 设置、数据库创建、运行安全查询套件。只在深度/opt-in 扫描时读这个。
-- `references/agent-semgrep-rules.md` — 自定义 Semgrep 规则集，把 12-factor-agents 架构反模式（框架黑盒实例化、缺失 intent dispatch、无显式循环的图编排、缺失错误压缩、状态散落、缺失 context serializer、中断式 human contact）映射为 SAST 信号。规则文件物化为 `rules/agent-antipatterns.yml`，扫描 agent 代码库时（LangChain、CrewAI、langgraph、AutoGen 等）通过 `run_scan.py --agent-rules` 自动加载，或作为 `--config rules/agent-antipatterns.yml` 与 `--config auto` 一起加载。
+- `references/agent-semgrep-rules.md` — 自定义 Semgrep 规则集，把 12-factor-agents 架构反模式（框架黑盒实例化、缺失 intent dispatch、无显式循环的图编排、缺失错误压缩、状态散落、缺失 context serializer、中断式 human contact）映射为 SAST 信号。规则文件物化为 `rules/agent-antipatterns.yml`，扫描 agent 代码库时（LangChain、CrewAI、langgraph、AutoGen 等）通过 `run_scan.py --agent-rules` 自动加载，或作为 `--config rules/agent-antipatterns.yml` 与 `--config auto` 一起加载；`--agent-rules` 同一遍扫描还会并列加载 `rules/llm-security.yml`（LLM/agent 输出 taint 规则，说明见 `references/llm-security-rules.md`）。

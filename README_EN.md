@@ -13,8 +13,8 @@ English | [中文](README.md)
 - **SCA + secret dual channels** (run regardless of detected languages): Trivy for ecosystem-wide dependency CVEs (install chain pinned to v0.74.0 with SHA256 checksum verification; DB staleness is materialized into `trivy-version.json` so zero results are no longer misread as "safe"); Gitleaks + Trufflehog as an independent secret-scanning dual channel decoupled from Semgrep `p/secrets` — the parser layer keeps only rule id/detector name, credential raw text never reaches disk or reports (`redact.py` is defense in depth)
 - **10 language-specific scanners**: Python→Bandit; Java→FindSecBugs; Go→Gosec; C/C++→Flawfinder+Cppcheck; Ruby→Brakeman; PHP→Psalm; .NET→Security Code Scan; Rust→cargo-audit+Miri; JS/TS→njsscan+retire.js+eslint-plugin-security; IaC→checkov+tfsec
 - **AI code review (OCR, separately triggered)**: `--ocr` whole-file audit / `--ocr-delegate` git diff review, run independently after SAST to catch logic bugs, performance and maintainability concerns
-- **Agent codebase anti-pattern rules**: `--agent-rules` loads `rules/agent-antipatterns.yml`, turning 12-factor-agents architecture violations (framework black-box instantiation, missing intent dispatch, graph orchestration without explicit loops, etc.) into SAST signals
-- **Engineering features**: `--ci` mode (exit code reflects severity + GitHub Actions annotations), `--gate` threshold, `--diff-only` incremental scan (hash cache), `--format md|html|json`, `--trend` comparison, `--triage` LLM false-positive filtering prompts, three-layer finding deduplication with multi-tool confirmation marks
+- **Agent codebase anti-pattern rules**: `--agent-rules` loads `rules/agent-antipatterns.yml`, turning 12-factor-agents architecture violations (framework black-box instantiation, missing intent dispatch, graph orchestration without explicit loops, etc.) into SAST signals; the same pass also loads `rules/llm-security.yml` (taint rules for LLM/agent output flowing into shell/eval/SQL/URL/file/template/HTML sinks — see `references/llm-security-rules.md`)
+- **Engineering features**: `--ci` mode (exit code reflects severity + GitHub Actions annotations), `--gate` threshold, `--diff-only` incremental scan (hash cache), `--format md|html|json`, `--trend` comparison, `--triage` three-verdict triage prompts (true_positive/false_positive/needs_validation, severity on true_positive entries only), three-layer finding deduplication with multi-tool confirmation marks
 - **Explicit failure**: missing/failed/skipped tools are annotated with reasons in the report; a clean scan reflects tool coverage only and is never presented as "the code is secure"
 
 ## 📦 Installation
@@ -49,19 +49,19 @@ python3 {SKILL_DIR}/scripts/run_scan.py <target-dir> --out results
 
 # 4. Generate the unified report (md|html|json|all)
 python3 {SKILL_DIR}/scripts/generate_report.py results --out report.md
-#    Trends: --trend; LLM triage prompts: --triage
+#    Trends: --trend; three-verdict triage prompts (true_positive/false_positive/needs_validation): --triage
 ```
 
 Natural-language triggers (in a skills-aware agent session): "security audit this project", "scan for hardcoded secrets", "pre-release security check", "SAST on this agent codebase".
 
 ## ✅ Tests & Verification
 
-Measured pytest run (2026-09-13, Python 3.12):
+Measured pytest run (2026-09-28, Python 3.12.3):
 
 ```text
 $ python3 -m pytest tests -q
-.......................................................................  [100%]
-503 passed in 11.13s
+...........................................                              [100%]
+547 passed in 16.62s
 ```
 
 Eleven test files covering: language-detection coverage, report generation, run_scan orchestration, SARIF output, redaction, OCR integration, secret dual-channel absorption (strix absorption), fix regressions, and optimization items.
@@ -77,9 +77,14 @@ tiangang/
 ├── references/
 │   ├── tools.md             # Full language tool table: detection signals/install/scan commands/output formats
 │   ├── codeql.md            # Standalone CodeQL deep-scan workflow (read only when opted in)
-│   └── agent-semgrep-rules.md  # agent anti-pattern rule-set docs
+│   ├── agent-semgrep-rules.md  # agent anti-pattern rule-set docs
+│   ├── llm-security-rules.md   # LLM/agent output taint rule-set docs (AI-AND-LLM attack surface)
+│   ├── coverage-map.md      # static mapping of 12 attack domains → detection channels (kept in sync with the report COVERAGE_MAP)
+│   └── ocr-security-backgrounds.md  # OCR per-project-type logic-level vulnerability hunting presets
 ├── rules/
-│   └── agent-antipatterns.yml  # materialized Semgrep agent anti-pattern rules
+│   ├── agent-antipatterns.yml  # materialized Semgrep agent anti-pattern rules
+│   ├── llm-security.yml     # LLM/agent output taint rules (shell/eval/SQL/URL/file/template/HTML sinks)
+│   └── web-baseline.yml     # web baseline rules (wildcard CORS + credentials, missing cookie security flags, etc.)
 ├── scripts/
 │   ├── detect_languages.py  # Step 1: manifest strong signals + extension-count weak signals
 │   ├── install_tools.sh     # Step 2: installs only missing tools; Trivy pinned v0.74.0 + checksum
@@ -88,7 +93,7 @@ tiangang/
 │   ├── sarif_report.py      # SARIF aggregation
 │   └── redact.py            # generic regex redaction (defense in depth)
 ├── open-code-review/        # OCR integration reference
-└── tests/                   # pytest suite (503 cases, 11 files)
+└── tests/                   # pytest suite (547 cases, 11 files)
 ```
 
 ## 🔮 Boundaries

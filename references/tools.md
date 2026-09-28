@@ -11,10 +11,13 @@
 - 检查:`command -v semgrep`
 - 安装:`uv tool install semgrep`(或 `pipx install semgrep`,如果 pipx 可用且更偏好它)
 - 扫描:`semgrep scan --config auto --sarif --output <out>/semgrep.sarif <target>`
+  - 主配置链还包含打包的离线基线规则 `--config rules/web-baseline.yml`(始终启用,本地文件不依赖网络);目标检出 `.github/workflows/*.yml|.yaml`(CI 工作流是授权代码——什么事件触发工作流、谁的代码在跑、能碰到哪些 secrets)时追加 registry 规则集 `--config p/github-actions`。
+  - `--config auto` 与 `--metrics=off` 在 semgrep >=1.168 互斥(`Cannot create auto config when metrics are off`),所以含 `auto` 的那次调用不传该参数;遥测只在不含 `auto` 的调用(离线回退、agent 规则)上显式关闭。
   - 如果离线或 `--config auto` 连不上 Semgrep 的 registry,回退到
     `semgrep scan --config p/security-audit --config p/secrets --sarif --output <out>/semgrep.sarif <target>`,
-    它使用打包好的规则集,在规则包缓存完成后不需要网络调用。
+    它使用打包好的规则集,在规则包缓存完成后不需要网络调用;回退链保留 web-baseline、丢弃 `p/github-actions`(registry 规则集在受限网络下只会再次失败)。
 - 输出:SARIF,位于 `<out>/semgrep.sarif`
+- **打包规则集**:`rules/web-baseline.yml` —— Web 安全基线,离线本地规则,主配置链与回退链始终加载;`rules/llm-security.yml` —— LLM/agent 代码库安全规则,与 `--agent-rules` 指定的 `rules/agent-antipatterns.yml`(说明见 `references/agent-semgrep-rules.md`)在同一次 `semgrep-agent` 扫描中并列加载。规则文件缺失时告警并跳过该文件,不中断扫描。
 
 ## 通用 SCA + 密钥扫描通道
 
@@ -237,6 +240,7 @@ AI 驱动的代码审查工具，读取 Git diff 并生成结构化、行级精�
 - **退出码语义**：rc=1 表示发现了 finding（不是 failure）。`run_scan.py` 在输出文件存在时把 rc=1 归一化为 0。
 - **secret-on-disk 防护**：OCR 的 `content` 字段可能包含代码片段。`generate_report.py` 的 parser 层 + `redact.py` 的通用脱敏确保凭证不进报告。
 - **自定义规则**：支持项目级 `.opencodereview/rule.json`，通过路径匹配 + 自然语言规则补充内置审查规则。
+- **审查背景预设**：`--ocr` 时 `run_scan.py` 按 `_ocr_project_kind()`（Cargo.toml/go.mod/package.json/requirements.txt|pyproject.toml/pubspec.yaml/通用）依次合并：语言维度审查背景 + 该类型的逻辑级漏洞猎捕预设（业务逻辑/认证/租户隔离/资源耗尽四维度）+ 用户 `--ocr-background`（追加在最后）。预设问题清单见 `references/ocr-security-backgrounds.md`。
 
 ## 检测参考（由 `detect_languages.py` 使用）
 
@@ -250,7 +254,7 @@ AI 驱动的代码审查工具，读取 Git diff 并生成结构化、行级精�
 | PHP | `composer.json` | `.php` |
 | .NET | `.csproj`、`.sln` | `.cs` |
 | Rust | `Cargo.toml` | `.rs` |
-| IaC | `main.tf`、`terraform.tf`、`Chart.yaml`、`Dockerfile`、`docker-compose.yml` | `.tf`、`.hcl` |
+| IaC | `main.tf`、`terraform.tf`、`Chart.yaml`、`Dockerfile`、`docker-compose.yml`、`.github/workflows/*.yml`(路径级匹配,文件名匹配表达不了) | `.tf`、`.hcl` |
 | Kotlin | — | `.kt`、`.kts` |
 | Swift | — | `.swift` |
 | Scala | — | `.scala` |
