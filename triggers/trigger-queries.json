@@ -1,0 +1,27 @@
+{
+  "skill": "tiangang",
+  "queries": [
+    {"q": "扫描这个项目有没有 SQL 注入", "expect": "trigger"},
+    {"q": "检查代码里有没有硬编码的密钥和 token", "expect": "trigger"},
+    {"q": "发布前做一次安全检查", "expect": "trigger"},
+    {"q": "跑一下 SAST 扫描，出份漏洞报告", "expect": "trigger"},
+    {"q": "看看有没有 unsafe eval、不安全的反序列化", "expect": "trigger"},
+    {"q": "帮我对这个服务做一次安全审查", "expect": "trigger"},
+    {"q": "这个 C 模块查一下缓冲区溢出风险", "expect": "trigger"},
+    {"q": "扫一遍仓库里的 secrets 泄露", "expect": "trigger"},
+    {"q": "用 semgrep 把这个仓库全量扫一遍", "expect": "trigger"},
+    {"q": "给这个 Python 项目做代码安全检查", "expect": "trigger"},
+    {"q": "对这次提交做 AI 代码审查，重点看安全问题", "expect": "trigger"},
+    {"q": "检查一下这些接口有没有越权和 CSRF 风险", "expect": "trigger"},
+    {"q": "帮我 review 这个 PR 的整体代码质量", "expect": "no", "owner": "diting"},
+    {"q": "审查一下这个模块的架构分层和命名风格", "expect": "no", "owner": "diting"},
+    {"q": "审一下这个 PR，改动有点大", "expect": "no", "owner": "diting"},
+    {"q": "新项目脚手架里把 pre-commit 和 CI 配好", "expect": "no", "owner": "pangu"},
+    {"q": "项目初始化时加上覆盖率门禁和安全审计钩子", "expect": "no", "owner": "pangu"},
+    {"q": "这个功能的算法写得对不对？帮我 review 正确性", "expect": "no", "owner": "diting"},
+    {"q": "做一次安全架构设计评审：信任边界怎么划", "expect": "no", "owner": "kueiku"},
+    {"q": "分析一下依赖树里的安全漏洞和版本冲突", "expect": "no", "owner": "dayv"},
+    {"q": "commit 前按三维度协议安排并行审查", "expect": "no", "owner": "pua"},
+    {"q": "把这个接口的参数校验补全，防止脏数据", "expect": "no", "owner": "none"}
+  ]
+}
