@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "name": "tiangang bundled-rule accuracy bench",
+  "ground_truth_scope": "本靶场只覆盖 tiangang 打包离线规则集（llm-security.yml / web-baseline.yml）可静态判定的最小子集：4 个阳性样例（每个恰好一个已知漏洞点）+ 1 个阴性对照。这不是规则集覆盖面的完整清单，也不构成对扫描器整体召回率的度量——registry 规则集（--config auto）与各语言专属工具不在本基准范围内。",
+  "rules": [
+    "rules/llm-security.yml",
+    "rules/web-baseline.yml"
+  ],
+  "expectations": [
+    {
+      "id": "sql-injection",
+      "class": "sqli",
+      "cwe": "CWE-89",
+      "file": "fixtures/sql_injection.py",
+      "expect_rule": "llm-sec-output-to-sql",
+      "negative": false
+    },
+    {
+      "id": "command-injection",
+      "class": "command-injection",
+      "cwe": "CWE-78",
+      "file": "fixtures/command_injection.py",
+      "expect_rule": "llm-sec-output-to-shell",
+      "negative": false
+    },
+    {
+      "id": "xss-render",
+      "class": "xss",
+      "cwe": "CWE-79",
+      "file": "fixtures/xss_render.js",
+      "expect_rule": "llm-sec-output-to-html-render",
+      "negative": false
+    },
+    {
+      "id": "ssti",
+      "class": "ssti",
+      "cwe": "CWE-1336",
+      "file": "fixtures/ssti.py",
+      "expect_rule": "llm-sec-output-to-template-render",
+      "negative": false
+    },
+    {
+      "id": "negative-control",
+      "class": "sanitized-data-flow",
+      "cwe": null,
+      "file": "fixtures/negative_control.py",
+      "expect_rule": null,
+      "negative": true
+    }
+  ]
+}

@@ -17,7 +17,7 @@
     `semgrep scan --config p/security-audit --config p/secrets --sarif --output <out>/semgrep.sarif <target>`,
     它使用打包好的规则集,在规则包缓存完成后不需要网络调用;回退链保留 web-baseline、丢弃 `p/github-actions`(registry 规则集在受限网络下只会再次失败)。
 - 输出:SARIF,位于 `<out>/semgrep.sarif`
-- **打包规则集**:`rules/web-baseline.yml` —— Web 安全基线,离线本地规则,主配置链与回退链始终加载;`rules/llm-security.yml` —— LLM/agent 代码库安全规则,与 `--agent-rules` 指定的 `rules/agent-antipatterns.yml`(说明见 `references/agent-semgrep-rules.md`)在同一次 `semgrep-agent` 扫描中并列加载。规则文件缺失时告警并跳过该文件,不中断扫描。
+- **打包规则集**:`rules/web-baseline.yml` —— Web 安全基线,离线本地规则,主配置链与回退链始终加载;`rules/llm-security.yml` —— LLM/agent 代码库安全规则,与 `--agent-rules` 指定的 `rules/agent-antipatterns.yml`(说明见 `agent-semgrep-rules.md`)在同一次 `semgrep-agent` 扫描中并列加载。规则文件缺失时告警并跳过该文件,不中断扫描。
 
 ## 通用 SCA + 密钥扫描通道
 
@@ -240,7 +240,7 @@ AI 驱动的代码审查工具，读取 Git diff 并生成结构化、行级精�
 - **退出码语义**：rc=1 表示发现了 finding（不是 failure）。`run_scan.py` 在输出文件存在时把 rc=1 归一化为 0。
 - **secret-on-disk 防护**：OCR 的 `content` 字段可能包含代码片段。`generate_report.py` 的 parser 层 + `redact.py` 的通用脱敏确保凭证不进报告。
 - **自定义规则**：支持项目级 `.opencodereview/rule.json`，通过路径匹配 + 自然语言规则补充内置审查规则。
-- **审查背景预设**：`--ocr` 时 `run_scan.py` 按 `_ocr_project_kind()`（Cargo.toml/go.mod/package.json/requirements.txt|pyproject.toml/pubspec.yaml/通用）依次合并：语言维度审查背景 + 该类型的逻辑级漏洞猎捕预设（业务逻辑/认证/租户隔离/资源耗尽四维度）+ 用户 `--ocr-background`（追加在最后）。预设问题清单见 `references/ocr-security-backgrounds.md`。
+- **审查背景预设**：`--ocr` 时 `run_scan.py` 按 `_ocr_project_kind()`（Cargo.toml/go.mod/package.json/requirements.txt|pyproject.toml/pubspec.yaml/通用）依次合并：语言维度审查背景 + 该类型的逻辑级漏洞猎捕预设（业务逻辑/认证/租户隔离/资源耗尽四维度）+ 用户 `--ocr-background`（追加在最后）。预设问题清单见 `ocr-security-backgrounds.md`。
 
 ## 检测参考（由 `detect_languages.py` 使用）
 

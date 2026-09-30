@@ -19,7 +19,7 @@
 | 9 | 资源耗尽与可用性 | RESOURCE-EXHAUSTION-AND-AVAILABILITY.md | 计算放大、资源累积、配额/调度、故障恢复 | 无专属静态通道 | tiangang 结构性盲区，恒报 `not covered`；需本地沙箱内的压测/容量审查或 OCR |
 | 10 | 数据隔离与生命周期 | DATA-ISOLATION-AND-LIFECYCLE.md | 租户隔离、派生数据、导出/备份/迁移、删除/撤销 | semgrep + brakeman/psalm/findsecbugs | SAST 弱信号（注入/越权模式可达）；租户隔离与生命周期逻辑需人工或 OCR |
 | 11 | 桌面 / 移动 / 本地 IPC | DESKTOP-MOBILE-AND-LOCAL-IPC.md | 深链、WebView 桥、导出组件、特权助手、Unix socket/XPC/Binder | 无专属静态通道 | tiangang 结构性盲区，恒报 `not covered`；需人工或 OCR |
-| 12 | 验证与报告纪律 | VALIDATION-AND-REPORTING.md | 候选验证、三态裁决、严重度锚点、反拔高 | `generate_report.py --triage`（true_positive/false_positive/needs_validation 三态 verdict + 反拔高纪律 + 严重度锚点） | 报告层流程纪律，非检测通道——不进 `COVERAGE_MAP`，不参与覆盖小节 |
+| 12 | 验证与报告纪律 | VALIDATION-AND-REPORTING.md | 候选验证、三态裁决、严重度锚点、反拔高 | `generate_report.py --triage`（true_positive/false_positive/needs_validation 三态 verdict + 反拔高纪律 + 严重度锚点 + 误报模式核对与拒绝合理化表，见 `false-positive-patterns.md`） | 报告层流程纪律，非检测通道——不进 `COVERAGE_MAP`，不参与覆盖小节 |
 
 ## 与报告生成器的对应关系
 

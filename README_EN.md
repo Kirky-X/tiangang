@@ -14,7 +14,7 @@ English | [中文](README.md)
 - **10 language-specific scanners**: Python→Bandit; Java→FindSecBugs; Go→Gosec; C/C++→Flawfinder+Cppcheck; Ruby→Brakeman; PHP→Psalm; .NET→Security Code Scan; Rust→cargo-audit+Miri; JS/TS→njsscan+retire.js+eslint-plugin-security; IaC→checkov+tfsec
 - **AI code review (OCR, separately triggered)**: `--ocr` whole-file audit / `--ocr-delegate` git diff review, run independently after SAST to catch logic bugs, performance and maintainability concerns
 - **Agent codebase anti-pattern rules**: `--agent-rules` loads `rules/agent-antipatterns.yml`, turning 12-factor-agents architecture violations (framework black-box instantiation, missing intent dispatch, graph orchestration without explicit loops, etc.) into SAST signals; the same pass also loads `rules/llm-security.yml` (taint rules for LLM/agent output flowing into shell/eval/SQL/URL/file/template/HTML sinks — see `references/llm-security-rules.md`)
-- **Engineering features**: `--ci` mode (exit code reflects severity + GitHub Actions annotations), `--gate` threshold, `--diff-only` incremental scan (hash cache), `--format md|html|json`, `--trend` comparison, `--triage` three-verdict triage prompts (true_positive/false_positive/needs_validation, severity on true_positive entries only), three-layer finding deduplication with multi-tool confirmation marks
+- **Engineering features**: `--ci` mode (exit code reflects severity + GitHub Actions annotations), `--gate` threshold, `--diff-only` incremental scan (hash cache), `--format md|html|json`, `--trend` comparison, `--triage` three-verdict triage prompts (true_positive/false_positive/needs_validation, severity on true_positive entries only, with built-in false-positive pattern checks and rationalization-rejection discipline), `--details` per-finding artifacts (`findings/F-####.md` + CSV index), run metadata (tool versions/durations in manifest and report), three-layer finding deduplication with multi-tool confirmation marks
 - **Explicit failure**: missing/failed/skipped tools are annotated with reasons in the report; a clean scan reflects tool coverage only and is never presented as "the code is secure"
 
 ## 📦 Installation
@@ -50,21 +50,22 @@ python3 {SKILL_DIR}/scripts/run_scan.py <target-dir> --out results
 # 4. Generate the unified report (md|html|json|all)
 python3 {SKILL_DIR}/scripts/generate_report.py results --out report.md
 #    Trends: --trend; three-verdict triage prompts (true_positive/false_positive/needs_validation): --triage
+#    Per-finding detail files (findings/F-####.md + index.csv): --details
 ```
 
 Natural-language triggers (in a skills-aware agent session): "security audit this project", "scan for hardcoded secrets", "pre-release security check", "SAST on this agent codebase".
 
 ## ✅ Tests & Verification
 
-Measured pytest run (2026-09-28, Python 3.12.3):
+Measured pytest run (2026-10-01, Python 3.12.3):
 
 ```text
 $ python3 -m pytest tests -q
-...........................................                              [100%]
-547 passed in 16.62s
+..........................................                                [100%]
+586 passed in 17.56s
 ```
 
-Eleven test files covering: language-detection coverage, report generation, run_scan orchestration, SARIF output, redaction, OCR integration, secret dual-channel absorption (strix absorption), fix regressions, and optimization items.
+Thirteen test files covering: language-detection coverage, report generation, run_scan orchestration, SARIF output, redaction, OCR integration, secret dual-channel absorption (strix absorption), false-positive patterns & per-finding artifacts absorption (fp patterns absorption), scanner accuracy benchmark (bench), fix regressions, and optimization items.
 
 Smoke tests: `detect_languages.py` correctly returns `{"languages": ["python"]}` on a sample directory containing `requirements.txt`; the Trivy installer in `install_tools.sh` verifies the downloaded binary's SHA256 checksum (`TRIVY_VERSION="0.74.0"`).
 
@@ -80,6 +81,7 @@ tiangang/
 │   ├── agent-semgrep-rules.md  # agent anti-pattern rule-set docs
 │   ├── llm-security-rules.md   # LLM/agent output taint rule-set docs (AI-AND-LLM attack surface)
 │   ├── coverage-map.md      # static mapping of 12 attack domains → detection channels (kept in sync with the report COVERAGE_MAP)
+│   ├── false-positive-patterns.md  # SAST false-positive pattern library: 10 pattern classes + rationalization-rejection table + devil's advocate gate
 │   └── ocr-security-backgrounds.md  # OCR per-project-type logic-level vulnerability hunting presets
 ├── rules/
 │   ├── agent-antipatterns.yml  # materialized Semgrep agent anti-pattern rules
@@ -89,11 +91,12 @@ tiangang/
 │   ├── detect_languages.py  # Step 1: manifest strong signals + extension-count weak signals
 │   ├── install_tools.sh     # Step 2: installs only missing tools; Trivy pinned v0.74.0 + checksum
 │   ├── run_scan.py          # Step 3: plugin-based orchestration (ToolPlugin), --ci/--gate/--diff-only/--ocr
-│   ├── generate_report.py   # Step 4: multi-format parsing → unified report (--trend/--triage)
+│   ├── generate_report.py   # Step 4: multi-format parsing → unified report (--trend/--triage/--details)
+│   ├── run_bench.py         # bundled-rule accuracy benchmark (TP/FP/FN scorecard)
 │   ├── sarif_report.py      # SARIF aggregation
 │   └── redact.py            # generic regex redaction (defense in depth)
 ├── open-code-review/        # OCR integration reference
-└── tests/                   # pytest suite (547 cases, 11 files)
+└── tests/                   # pytest suite + bench/ known-vuln range (fixtures + manifest + README)
 ```
 
 ## 🔮 Boundaries

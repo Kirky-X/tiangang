@@ -202,6 +202,35 @@ def have(cmd):
     return shutil.which(cmd) is not None
 
 
+# Tools whose version probe differs from the default ``<tool> --version``:
+# cargo-audit is a cargo subcommand, eslint-security runs through the
+# project-local eslint (npx --no-install never downloads).
+_VERSION_CMD_OVERRIDES = {
+    "cargo-audit": ["cargo", "audit", "--version"],
+    "eslint-security": ["npx", "--no-install", "eslint", "--version"],
+}
+
+
+def _collect_tool_versions(tool_names, timeout=15):
+    """Best-effort version probe for the tools that actually ran.
+
+    Results land in scan_manifest.json under ``tool_versions`` so a report can
+    state exactly which scanner versions produced the findings (reproducibility
+    + upgrade-triage: a finding that appears/disappears across runs is often a
+    rule-update artifact, not a code change). Failures are explicit: a tool
+    that won't report a version gets ``null``, never a silent omission.
+    """
+    versions = {}
+    for name in sorted({t for t in tool_names if t}):
+        cmd = _VERSION_CMD_OVERRIDES.get(name, [name, "--version"])
+        rc, out = sh(cmd, timeout=timeout)
+        first_line = next(
+            (ln.strip() for ln in (out or "").splitlines() if ln.strip()), ""
+        )
+        versions[name] = first_line[:100] if rc == 0 and first_line else None
+    return versions
+
+
 def detect_languages(target, max_depth=0):
     """Detect languages in target dir. Returns {} on failure (with warning to stderr).
 
@@ -258,7 +287,10 @@ def run_tool(
     cmd MUST be a list — the shell is never invoked, preventing command injection.
     output_stream: "stdout" or "stderr" — which stream to write to output_file
                    (cppcheck writes XML to stderr).
+    Each ran entry records duration_ms so the manifest (and the report's run
+    metadata section) can show where scan wall-clock time went.
     """
+    start = time.monotonic()
     try:
         proc = subprocess.run(
             cmd,
@@ -291,6 +323,7 @@ def run_tool(
             "command": " ".join(cmd) if isinstance(cmd, list) else cmd,
             "returncode": rc,
             "log_tail": log[-2000:] if log else "",
+            "duration_ms": int((time.monotonic() - start) * 1000),
         }
     )
 
@@ -367,6 +400,7 @@ def _run_semgrep(target, out_dir, ran, agent_rules=None):
       across hosts instead of depending on semgrep's host-dependent defaults.
     """
     sarif = os.path.join(out_dir, "semgrep.sarif")
+    semgrep_start = time.monotonic()
     web_baseline = os.path.join(_RULES_DIR, "web-baseline.yml")
     # Bundled offline baseline rules — always enabled (both the online chain
     # and the offline fallback; local file, no network dependency). Missing
@@ -460,6 +494,7 @@ def _run_semgrep(target, out_dir, ran, agent_rules=None):
             "command": command_str,
             "returncode": rc,
             "log_tail": log_tail[-2000:] if log_tail else "",
+            "duration_ms": int((time.monotonic() - semgrep_start) * 1000),
         }
     )
 
@@ -2364,6 +2399,9 @@ def main():
         "diff_mode": diff_mode,
         "ci_mode": args.ci,
         "gate": args.gate if args.ci else None,
+        "tool_versions": _collect_tool_versions(
+            [entry.get("tool") for entry in ran]
+        ),
     }
     manifest_path = os.path.join(out_dir, "scan_manifest.json")
     with open(manifest_path, "w") as f:

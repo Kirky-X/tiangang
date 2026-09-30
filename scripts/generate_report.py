@@ -24,10 +24,13 @@ Usage:
 """
 
 import argparse
+import csv
+import functools
 import json
 import os
 import re
 import sys
+import textwrap
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -52,6 +55,12 @@ SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
 # Used on the union of rule.tags / rule.id / bandit test_id to recover the
 # CWE reference each tool emits in its own dialect.
 _CWE_RE = re.compile(r"cwe[-_/ ]?(\d{1,5})", re.IGNORECASE)
+
+# Detail artifacts carry scanner-provided content, so cwe_url is only
+# rendered as a link when it points at the MITRE CWE site — anything else
+# (tool output is attacker/target-influenced) stays plain text, never a
+# clickable link into a report consumer's browser.
+_CWE_URL_PREFIX = "https://cwe.mitre.org/"
 
 
 def _cwe_from_iterable(values):
@@ -147,6 +156,17 @@ def _line_sort_key(line):
     if s.isdigit():
         return (0, int(s))
     return (1, s)
+
+
+def _report_sort_key(f):
+    """Canonical finding order shared by every report form (md/html/details):
+    severity rank, then file, then line. One copy — the per-finding detail
+    IDs (F-####) derive from this order and must match the report's."""
+    return (
+        SEVERITY_RANK.get(f["severity"], 99),
+        f["file"],
+        _line_sort_key(f["line"]),
+    )
 
 
 def parse_sarif(path, tool_name):
@@ -1201,9 +1221,39 @@ def render_report(results_dir, findings, parse_errors, manifest):
         for r in failed_tools:
             tail = r.get("log_tail", "")
             lines.append(
-                f"- **{r['tool']}** (exit {r['returncode']}): {tail[-300:] if tail else '(no output)'}"
+                f"- **{r.get('tool', '?')}** (exit {r.get('returncode', '?')}): "
+                f"{tail[-300:] if tail else '(no output)'}"
             )
         lines.append("")
+
+    # Run metadata: per-tool durations + versions, recorded by run_scan.py in
+    # the manifest (older manifests carry neither — the section then renders
+    # nothing so historical results stay byte-identical). Surface here so the
+    # aggregate report answers "what exactly ran, how long did it take, with
+    # which tool versions" without opening scan_manifest.json.
+    ran_entries = [r for r in manifest.get("ran", []) if isinstance(r, dict)]
+    tool_versions = manifest.get("tool_versions") or {}
+    timed_entries = [
+        (r.get("tool", "?"), r.get("returncode"), r.get("duration_ms"))
+        for r in ran_entries
+        if r.get("duration_ms") is not None
+    ]
+    if tool_versions or timed_entries:
+        lines.append("## Run metadata")
+        lines.append("")
+        if tool_versions:
+            lines.append("Tool versions:")
+            lines.append("")
+            for name in sorted(tool_versions):
+                version = tool_versions[name] or "(version unknown)"
+                lines.append(f"- **{name}**: {version}")
+            lines.append("")
+        if timed_entries:
+            lines.append("| Tool | Exit | Duration (ms) |")
+            lines.append("|---|---|---|")
+            for name, rc, duration_ms in timed_entries:
+                lines.append(f"| {name} | {rc} | {duration_ms} |")
+            lines.append("")
 
     # Attack-surface coverage: deterministic per-domain lookup over the same
     # manifest data (map: references/coverage-map.md). No model involved.
@@ -1224,14 +1274,7 @@ def render_report(results_dir, findings, parse_errors, manifest):
         )
         return "\n".join(lines)
 
-    findings_sorted = sorted(
-        findings,
-        key=lambda f: (
-            SEVERITY_RANK.get(f["severity"], 99),
-            f["file"],
-            _line_sort_key(f["line"]),
-        ),
-    )
+    findings_sorted = sorted(findings, key=_report_sort_key)
 
     lines.append("## Findings")
     lines.append("")
@@ -1317,14 +1360,7 @@ def render_html_report(results_dir, findings, parse_errors, manifest):
             "<p>No findings. This does not guarantee the code is free of security issues.</p>"
         )
     else:
-        findings_sorted = sorted(
-            findings,
-            key=lambda f: (
-                SEVERITY_RANK.get(f["severity"], 99),
-                f["file"],
-                _line_sort_key(f["line"]),
-            ),
-        )
+        findings_sorted = sorted(findings, key=_report_sort_key)
         current_sev = None
         for f in findings_sorted:
             if f["severity"] != current_sev:
@@ -1375,6 +1411,173 @@ def render_json_report(results_dir, findings, parse_errors, manifest):
     )
 
 
+# --- Per-finding detail artifacts (--details) --------------------------------
+# Mechanism absorbed from strix's multi-form report artifacts: one scan result
+# set is consumed in several shapes — the aggregate report (md/html/json),
+# SARIF, and one file per finding so a reviewer/agent can hand a single
+# vulnerability to a fix task without extracting it from the aggregate report.
+
+# A CSV cell whose first character is one of these is evaluated as a
+# spreadsheet formula on open (CWE-1236) — Excel-class apps execute it rather
+# than showing text. Finding messages quote text from the scanned target —
+# exactly the attacker-influenced input this guards against. The apostrophe
+# prefix is the standard mitigation: the rest of the cell stays literal text
+# instead of executing.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    """Return ``value`` as a CSV cell a spreadsheet will not evaluate."""
+    text = str(value)
+    if text.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + text
+    return text
+
+
+def _safe_fence(content):
+    """Open a code fence ``content`` cannot break out of.
+
+    A fenced block closes only on a backtick run at least as long as the
+    opener, so the opener is sized one run longer than the longest run inside
+    ``content`` (never below three). Snippets come from scanned source and may
+    contain backticks of their own.
+    """
+    runs = re.findall(r"`+", content)
+    longest = max((len(r) for r in runs), default=0)
+    return "`" * max(3, longest + 1)
+
+
+# Finding detail files are named F-0001.md… in the canonical report order.
+def _finding_ref_path(details_dir, finding_id):
+    """Stable artifact path for a detail file: F-0001 → <dir>/F-0001.md."""
+    return os.path.join(details_dir, f"{finding_id}.md")
+
+
+def render_finding_detail(finding_id, f, target):
+    """Render one finding as a standalone Markdown detail file.
+
+    Carries the full finding metadata (severity/tool/rule/location/CWE/fix/
+    multi-tool confirmation), a secret-redacted code window when the scan
+    target is readable, and the triage pointer: dismissing this finding as a
+    false positive requires naming the pattern class (see
+    references/false-positive-patterns.md) with a source-line proof.
+    """
+    cwe = ""
+    cwe_url = f.get("cwe_url") or ""
+    if f.get("cwe"):
+        if cwe_url.startswith(_CWE_URL_PREFIX):
+            cwe = f"\n- **CWE:** [{f['cwe']}]({cwe_url})"
+        else:
+            # Non-MITRE (or missing) URL: keep the CWE id as plain text,
+            # never render a scanner-supplied link.
+            cwe = f"\n- **CWE:** {f['cwe']}"
+    confirmed = f.get("confirmed_by") or []
+    confirmed_note = ""
+    if confirmed:
+        confirmed_note = f"\n- **Confirmed by:** {', '.join(confirmed)}"
+    lines = [
+        f"# {finding_id} — [{f.get('severity', '?')}] "
+        f"{f.get('tool', '?')}:{f.get('rule', '?')}",
+        "",
+        f"- **Severity:** {f.get('severity', 'unknown')}",
+        f"- **Tool / rule:** {f.get('tool', '?')} / {f.get('rule', '?')}",
+        f"- **Location:** `{f.get('file', '?')}:{f.get('line', '?')}`"
+        f"{cwe}{confirmed_note}",
+        "",
+        "## Message",
+        "",
+        f.get("message", "") or "(no message)",
+    ]
+    if f.get("fix"):
+        lines.extend(["", "## Suggested fix", "", str(f["fix"])])
+    snippet, start, end = _extract_code_snippet(
+        f.get("file"), f.get("line"), target
+    )
+    if snippet is not None:
+        fence = _safe_fence(snippet)
+        lines.extend(
+            [
+                "",
+                f"## Code context (`{f.get('file')}:{start}-{end}`, "
+                "secret-redacted)",
+                "",
+                fence,
+                snippet,
+                fence,
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "## Code context",
+                "",
+                "(not available — the scan target is not readable at this "
+                "path; judge from the metadata only)",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Triage",
+            "",
+            "Before dismissing this as a false positive, check",
+            "references/false-positive-patterns.md: name the matching pattern",
+            "class and cite the source line that proves it. Uncertainty maps",
+            "to needs_validation, not silent dismissal.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_details(results_dir, findings, manifest):
+    """Write one Markdown file per finding plus a machine-readable CSV index.
+
+    Files land in ``<results-dir>/findings/`` as ``F-0001.md``… in the same
+    canonical order the aggregate report uses (``_report_sort_key``), so IDs
+    stay stable across regenerations of the same results dir. Returns
+    (count, details_dir).
+    """
+    details_dir = os.path.join(results_dir, "findings")
+    os.makedirs(details_dir, exist_ok=True)
+    target = manifest.get("target")
+    index_rows = [["id", "severity", "tool", "rule", "file", "line", "cwe", "detail_file"]]
+    for i, f in enumerate(sorted(findings, key=_report_sort_key), 1):
+        finding_id = f"F-{i:04d}"
+        text = render_finding_detail(finding_id, f, target)
+        with open(
+            _finding_ref_path(details_dir, finding_id), "w", encoding="utf-8"
+        ) as fh:
+            fh.write(text)
+        index_rows.append(
+            [
+                finding_id,
+                f.get("severity", "unknown"),
+                f.get("tool", "?"),
+                f.get("rule", "?"),
+                f.get("file", "?"),
+                f.get("line", "?"),
+                f.get("cwe", ""),
+                f"findings/{finding_id}.md",
+            ]
+        )
+    # stdlib csv.writer does RFC 4180 quoting, so finding-sourced values
+    # containing commas/quotes/newlines stay inside their cell (hand-joined
+    # strings would shift columns). _csv_safe still runs first for the
+    # formula-prefix guard (CWE-1236) — quoting does not neutralize "=".
+    with open(
+        os.path.join(details_dir, "index.csv"),
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as fh:
+        writer = csv.writer(fh, lineterminator="\n")
+        for row in index_rows:
+            writer.writerow([_csv_safe(cell) for cell in row])
+    return len(findings), details_dir
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("results_dir")
@@ -1389,6 +1592,12 @@ def main():
         "--triage",
         action="store_true",
         help="Generate LLM triage prompt for false positive assessment.",
+    )
+    parser.add_argument(
+        "--details",
+        action="store_true",
+        help="Write one Markdown file per finding (findings/F-####.md) plus "
+        "a machine-readable index.csv, for per-vulnerability consumption.",
     )
     parser.add_argument(
         "--trend",
@@ -1429,6 +1638,11 @@ def main():
         with open(triage_path, "w") as f:
             f.write(prompt)
         print(f"Triage prompt written to {triage_path} ({len(findings)} findings)")
+
+    # Per-finding detail artifacts if --details requested.
+    if args.details and findings:
+        count, details_dir = write_details(results_dir, findings, manifest)
+        print(f"Finding details written to {details_dir} ({count} files)")
 
     formats = ["md", "html", "json"] if args.format == "all" else [args.format]
     for fmt in formats:
@@ -1480,6 +1694,22 @@ def _resolve_finding_path(file_ref, target_root):
     return None
 
 
+@functools.lru_cache(maxsize=None)
+def _read_lines(path):
+    """Read a scan-target file once per process, as a tuple of lines.
+
+    Many findings land in the same file; without the cache each one re-reads
+    the whole target (N+1 I/O). The scan target is immutable while the report
+    is generated, so caching per absolute path is safe. Returns None when the
+    file cannot be read (unreadable/missing), mirroring the old OSError path.
+    """
+    try:
+        with open(path, errors="replace") as f:
+            return tuple(f.readlines())
+    except OSError:
+        return None
+
+
 def _extract_code_snippet(file_ref, line_no, target_root, max_lines=30):
     """Extract a secret-redacted code window around a finding location.
 
@@ -1491,11 +1721,7 @@ def _extract_code_snippet(file_ref, line_no, target_root, max_lines=30):
     path = _resolve_finding_path(file_ref, target_root)
     if path is None:
         return None, 0, 0
-    try:
-        with open(path, errors="replace") as f:
-            all_lines = f.readlines()
-    except OSError:
-        return None, 0, 0
+    all_lines = _read_lines(path)
     if not all_lines:
         return None, 0, 0
     try:
@@ -1519,6 +1745,26 @@ def _extract_code_snippet(file_ref, line_no, target_root, max_lines=30):
 # LLM gets metadata-only entries (see generate_triage_prompt).
 MAX_TRIAGE_SNIPPETS = 100
 
+# Canonical copy of the ten false-positive pattern classes; the triage
+# prompt below is assembled from this list. Two derived copies exist and
+# must stay aligned — references/false-positive-patterns.md (the Chinese
+# knowledge base, one `### N.` section per entry;
+# tests/test_fp_patterns_absorption.py asserts the one-to-one
+# correspondence) and SKILL.md (prose summary only). Add a new class here
+# first, then in the other two.
+FP_PATTERN_CLASSES = [
+    "test-only code",
+    "defensive check",
+    "unreachable path",
+    "framework-provided protection",
+    "sanitized data flow",
+    "sample/config file",
+    "trusted constant input",
+    "mathematically impossible bounds",
+    "no-concurrency context",
+    "defense-in-depth layer",
+]
+
 
 def generate_triage_prompt(findings, context=None):
     """Generate an LLM prompt for triaging findings with a three-state verdict.
@@ -1528,11 +1774,16 @@ def generate_triage_prompt(findings, context=None):
     decisive fact is not visible in the code). It carries an anti-escalation
     discipline — a flag is not a finding (trace the impact first), a crash is
     not strengthened into code execution, a missing best practice with no
-    affected principal/resource is hardening, not a vulnerability — and
-    severity anchors that apply to true_positive entries only: a
-    needs_validation entry never gets a severity, and severity cannot exceed
-    the demonstrated impact. Findings confirmed by multiple tools are
-    highlighted as higher-confidence. The output is a JSON array of
+    affected principal/resource is hardening, not a vulnerability — plus the
+    false-positive discipline absorbed from fp-check's mechanism: a
+    false_positive verdict must name the matching pattern class (see
+    references/false-positive-patterns.md) with a source-line proof, a table
+    of rationalizations that must be rejected instead of acted on, and a
+    devil's advocate gate a true_positive must pass (and record) before it is
+    issued. It also carries severity anchors that apply to true_positive
+    entries only: a needs_validation entry never gets a severity, and severity
+    cannot exceed the demonstrated impact. Findings confirmed by multiple
+    tools are highlighted as higher-confidence. The output is a JSON array of
     {index, verdict, confidence, reasoning} objects; ``severity`` is an
     additional optional field valid on true_positive entries only.
 
@@ -1549,6 +1800,26 @@ def generate_triage_prompt(findings, context=None):
     accordingly.
     """
     has_snippets_capable = bool(context)
+    # Pattern-class sentence assembled from the canonical FP_PATTERN_CLASSES
+    # constant (single hand-maintained copy) and wrapped to the prompt's
+    # line width. break_long_words/break_on_hyphens stay off so class names
+    # like "test-only code" are never split across lines.
+    fp_sentence = (
+        "- Name the pattern class that applies — "
+        + ", ".join(FP_PATTERN_CLASSES[:-1])
+        + ", or "
+        + FP_PATTERN_CLASSES[-1]
+        + " — and cite the source line that proves it. A hunch is not "
+        "evidence: if you cannot name the class and the proof line, the "
+        "verdict is needs_validation, not false_positive."
+    )
+    fp_discipline_lines = textwrap.wrap(
+        fp_sentence,
+        width=78,
+        subsequent_indent="  ",
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
     lines = [
         "You are a security analyst triaging SAST findings. For each finding below,",
         "assign exactly one verdict:",
@@ -1570,6 +1841,27 @@ def generate_triage_prompt(findings, context=None):
         "- A claim disproved by source is false_positive, never needs_validation.",
         "- needs_validation must NOT carry a severity field, and its reasoning",
         "  must not speculate the value of the missing fact.",
+        "",
+        "False-positive discipline (before any false_positive verdict):",
+        *fp_discipline_lines,
+        "",
+        "Rationalizations to reject — when one of these shows up, stop and",
+        "take the required action instead of acting on the thought:",
+        "- 'Probably a false positive, let it pass' — uncertainty is what",
+        "  needs_validation exists for; passing is not a verdict.",
+        "- 'The rule flagged it, so it must be real' — a rule is pattern matching;",
+        "  pattern is not vulnerability. Trace the data flow first.",
+        "- 'The framework probably handles it' — probably is not evidence; find",
+        "  the actual protective call site or do not claim it.",
+        "- 'It is only in test files, so it does not matter' — real credentials",
+        "  in tests are still real; separate pattern noise from true exposure.",
+        "- 'This feels critical' — severity never exceeds demonstrated impact.",
+        "",
+        "Devil's advocate gate (before any true_positive verdict):",
+        "- State the strongest case that this finding is a false positive by",
+        "  checking the pattern classes above. Issue true_positive only if that",
+        "  case fails, and record in the reasoning which pattern class you ruled",
+        "  out and on what evidence. An unrecorded review counts as not done.",
         "",
         "Consider:",
         "- Is the code path actually reachable?",
