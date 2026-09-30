@@ -906,7 +906,7 @@ rules:
 
 ## 注意事项
 
-- 强 sink 规则报 HIGH（`severity: ERROR`），弱信号规则只报 MID（`severity: WARNING`），与 `references/agent-semgrep-rules.md` 的严重度映射一致
+- 强 sink 规则报 HIGH（`severity: ERROR`），弱信号规则只报 MID（`severity: WARNING`），与 `agent-semgrep-rules.md` 的严重度映射一致
 - source 是命名启发式：`$OBJ.create` / `$OBJ(...)` 臂按命名圈定，Django `Model.objects.create(...)`、`boto3.client(...)` 等非 LLM 调用也会被当作 source——但必须继续流入 Rule 1-7 的 sink 才成 finding，单独出现不报；误报靠 sink 侧 `focus-metavariable` 收敛
 - Rule 8 是「信号由审核者验证」的退化策略，与 agent 规则集 Rule 3/4/6 的取舍同源（Semgrep 无法可靠断言「来源标注是否丢失」「内容是否攻击者可控」，规则退化为标记相关特征）；它只识别调用点直接拼接，`prompt = f"...{q}"` 后再 `llm.invoke(prompt)` 的跨语句形态需要数据流，识别不到，由审核者按 MID 信号人工回溯
 - AI-AND-LLM 中需要权限/意图语义的攻击面刻意不成规则：MCP 元数据与工具描述当策略（这些字段能引导模型但不能授权能力，要查的是确定性 allowlist 与 handler 授权）、action-confirmation 绑定、confused-deputy 权限、跨会话/跨租户上下文渗透、持久记忆投毒写侧——静态 taint 对它们不可判定，硬写成 pattern 只会产生噪声，由 tiangang 之外的 review/人工流程覆盖
