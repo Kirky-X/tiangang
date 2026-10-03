@@ -1490,16 +1490,13 @@ def render_finding_detail(finding_id, f, target):
     ]
     if f.get("fix"):
         lines.extend(["", "## Suggested fix", "", str(f["fix"])])
-    snippet, start, end = _extract_code_snippet(
-        f.get("file"), f.get("line"), target
-    )
+    snippet, start, end = _extract_code_snippet(f.get("file"), f.get("line"), target)
     if snippet is not None:
         fence = _safe_fence(snippet)
         lines.extend(
             [
                 "",
-                f"## Code context (`{f.get('file')}:{start}-{end}`, "
-                "secret-redacted)",
+                f"## Code context (`{f.get('file')}:{start}-{end}`, secret-redacted)",
                 "",
                 fence,
                 snippet,
@@ -1542,7 +1539,9 @@ def write_details(results_dir, findings, manifest):
     details_dir = os.path.join(results_dir, "findings")
     os.makedirs(details_dir, exist_ok=True)
     target = manifest.get("target")
-    index_rows = [["id", "severity", "tool", "rule", "file", "line", "cwe", "detail_file"]]
+    index_rows = [
+        ["id", "severity", "tool", "rule", "file", "line", "cwe", "detail_file"]
+    ]
     for i, f in enumerate(sorted(findings, key=_report_sort_key), 1):
         finding_id = f"F-{i:04d}"
         text = render_finding_detail(finding_id, f, target)
@@ -1891,7 +1890,7 @@ def generate_triage_prompt(findings, context=None):
         "",
         "Respond with a JSON array of objects:",
         '[{"index": 0, "verdict": "true_positive|false_positive|needs_validation", "confidence": "high|medium|low", "reasoning": "...", "severity": "critical|high|medium|low|info"}]',
-        "\"severity\" belongs on true_positive entries only; false_positive and",
+        '"severity" belongs on true_positive entries only; false_positive and',
         "needs_validation entries must NOT include it. Verdicts other than the",
         "three listed are invalid.",
         "",

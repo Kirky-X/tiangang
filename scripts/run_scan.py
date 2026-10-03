@@ -374,8 +374,7 @@ def _has_ci_workflows(target):
         return False
     try:
         return any(
-            os.path.isfile(os.path.join(wf_dir, f))
-            and f.endswith((".yml", ".yaml"))
+            os.path.isfile(os.path.join(wf_dir, f)) and f.endswith((".yml", ".yaml"))
             for f in os.listdir(wf_dir)
         )
     except OSError:
@@ -2399,9 +2398,7 @@ def main():
         "diff_mode": diff_mode,
         "ci_mode": args.ci,
         "gate": args.gate if args.ci else None,
-        "tool_versions": _collect_tool_versions(
-            [entry.get("tool") for entry in ran]
-        ),
+        "tool_versions": _collect_tool_versions([entry.get("tool") for entry in ran]),
     }
     manifest_path = os.path.join(out_dir, "scan_manifest.json")
     with open(manifest_path, "w") as f:

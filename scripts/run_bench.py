@@ -25,7 +25,7 @@ Usage:
 import argparse
 import json
 import os
-import shutil
+import shutil  # noqa: F401 — tests/test_bench.py 以 run_bench.shutil 为 monkeypatch 目标，须保留模块属性
 import subprocess
 import sys
 import time
@@ -175,9 +175,7 @@ def score(bench_dir, expectations, findings):
                 fp += len(bad)
                 entry.update(
                     outcome="FP",
-                    detail=[
-                        f"unexpected {b['rule']} at line {b['line']}" for b in bad
-                    ],
+                    detail=[f"unexpected {b['rule']} at line {b['line']}" for b in bad],
                 )
             else:
                 entry.update(outcome="clean", detail=[])
@@ -222,9 +220,7 @@ def score(bench_dir, expectations, findings):
             continue
         fp += 1
         file_ref = (
-            os.path.relpath(f["file"], REPO_ROOT)
-            if f["file"] in known
-            else f["file"]
+            os.path.relpath(f["file"], REPO_ROOT) if f["file"] in known else f["file"]
         )
         details.append(
             {
