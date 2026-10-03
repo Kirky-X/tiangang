@@ -1,0 +1,4 @@
+# vendored 工作区统一工具（scripts/vendor-skill-lint.sh 分发），非本仓业务代码，移出覆盖率统计
+[run]
+omit =
+    scripts/skill_lint.py
