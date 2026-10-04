@@ -13,16 +13,17 @@ English | [中文](README.md)
 - **SCA + secret dual channels** (run regardless of detected languages): Trivy for ecosystem-wide dependency CVEs (install chain pinned to v0.74.0 with SHA256 checksum verification; DB staleness is materialized into `trivy-version.json` so zero results are no longer misread as "safe"); Gitleaks + Trufflehog as an independent secret-scanning dual channel decoupled from Semgrep `p/secrets` — the parser layer keeps only rule id/detector name, credential raw text never reaches disk or reports (`redact.py` is defense in depth)
 - **10 language-specific scanners**: Python→Bandit; Java→FindSecBugs; Go→Gosec; C/C++→Flawfinder+Cppcheck; Ruby→Brakeman; PHP→Psalm; .NET→Security Code Scan; Rust→cargo-audit+Miri; JS/TS→njsscan+retire.js+eslint-plugin-security; IaC→checkov+tfsec
 - **AI code review (OCR, separately triggered)**: `--ocr` whole-file audit / `--ocr-delegate` git diff review, run independently after SAST to catch logic bugs, performance and maintainability concerns
-- **Agent codebase anti-pattern rules**: `--agent-rules` loads `rules/agent-antipatterns.yml`, turning 12-factor-agents architecture violations (framework black-box instantiation, missing intent dispatch, graph orchestration without explicit loops, etc.) into SAST signals; the same pass also loads `rules/llm-security.yml` (taint rules for LLM/agent output flowing into shell/eval/SQL/URL/file/template/HTML sinks — see `references/llm-security-rules.md`)
+- **Agent codebase anti-pattern rules**: `--agent-rules <path>` loads an agent anti-pattern rule set (pass the rule file path explicitly, e.g. `--agent-rules rules/agent-antipatterns.yml`), turning 12-factor-agents architecture violations (framework black-box instantiation, missing intent dispatch, graph orchestration without explicit loops, etc.) into SAST signals; the same pass also loads `rules/llm-security.yml` (taint rules for LLM/agent output flowing into shell/eval/SQL/URL/file/template/HTML sinks — see `references/llm-security-rules.md`)
 - **Engineering features**: `--ci` mode (exit code reflects severity + GitHub Actions annotations), `--gate` threshold, `--diff-only` incremental scan (hash cache), `--format md|html|json`, `--trend` comparison, `--triage` three-verdict triage prompts (true_positive/false_positive/needs_validation, severity on true_positive entries only, with built-in false-positive pattern checks and rationalization-rejection discipline), `--details` per-finding artifacts (`findings/F-####.md` + CSV index), run metadata (tool versions/durations in manifest and report), three-layer finding deduplication with multi-tool confirmation marks
 - **Explicit failure**: missing/failed/skipped tools are annotated with reasons in the report; a clean scan reflects tool coverage only and is never presented as "the code is secure"
 
 ## 📦 Installation
 
 ```bash
-# Option 1: one-command deploy from this repository root
-# (syncs to ~/.zcode/skills/ and ~/.claude/skills/, LF-normalized)
-bash scripts/sync-skills.sh tiangang
+# Option 1: the bundled installer (installs into the target project's agent
+# directory; defaults: --target . --agent claude → .claude/skills/)
+bash scripts/install-skill.sh install tiangang
+#    subcommands: install / update / uninstall / list-skills / list-agents / status / generate-commands; --all-agents for all 9 agent directories
 
 # Option 2: manual copy into an agent skills directory
 cp -r tiangang/ ~/.zcode/skills/tiangang/
@@ -45,7 +46,7 @@ bash {SKILL_DIR}/scripts/install_tools.sh python go    # or: all
 
 # 3. Run the scan (Semgrep always + SCA/secret channels + language-specific tools)
 python3 {SKILL_DIR}/scripts/run_scan.py <target-dir> --out results
-#    CI gate: --ci --gate high; incremental: --diff-only --since HEAD~1; agent repos: --agent-rules
+#    CI gate: --ci --gate high; incremental: --diff-only --since HEAD~1; agent repos: --agent-rules; depth-limited monorepos: --max-depth; sequential mode: --sequential
 
 # 4. Generate the unified report (md|html|json|all)
 python3 {SKILL_DIR}/scripts/generate_report.py results --out report.md
@@ -57,12 +58,12 @@ Natural-language triggers (in a skills-aware agent session): "security audit thi
 
 ## ✅ Tests & Verification
 
-Measured pytest run (2026-10-01, Python 3.12.3):
+Measured pytest run (2026-10-04, Python 3.12.3):
 
 ```text
 $ python3 -m pytest tests -q
 ..........................................                                [100%]
-586 passed in 17.56s
+591 passed in 95.31s (0:01:35)
 ```
 
 Thirteen test files covering: language-detection coverage, report generation, run_scan orchestration, SARIF output, redaction, OCR integration, secret dual-channel absorption (strix absorption), false-positive patterns & per-finding artifacts absorption (fp patterns absorption), scanner accuracy benchmark (bench), fix regressions, and optimization items.
@@ -74,7 +75,7 @@ Smoke tests: `detect_languages.py` correctly returns `{"languages": ["python"]}`
 ```text
 tiangang/
 ├── SKILL.md                 # Entry: four-step workflow + OCR triggers + report-reading discipline
-├── skill.json               # Metadata (v0.2.1, MIT)
+├── skill.json               # Metadata (v0.2.3, MIT)
 ├── references/
 │   ├── tools.md             # Full language tool table: detection signals/install/scan commands/output formats
 │   ├── codeql.md            # Standalone CodeQL deep-scan workflow (read only when opted in)
@@ -93,9 +94,13 @@ tiangang/
 │   ├── run_scan.py          # Step 3: plugin-based orchestration (ToolPlugin), --ci/--gate/--diff-only/--ocr
 │   ├── generate_report.py   # Step 4: multi-format parsing → unified report (--trend/--triage/--details)
 │   ├── run_bench.py         # bundled-rule accuracy benchmark (TP/FP/FN scorecard)
-│   ├── sarif_report.py      # SARIF aggregation
-│   └── redact.py            # generic regex redaction (defense in depth)
+│   ├── sarif_report.py      # SARIF aggregation (--validate structural check)
+│   ├── redact.py            # generic regex redaction (defense in depth)
+│   ├── install-skill.sh     # installer: install/update/uninstall/status subcommands (standalone skill-repo mode)
+│   └── skill_lint.py        # repo engineering-baseline linter (CI usage: python3 scripts/skill_lint.py .)
 ├── open-code-review/        # OCR integration reference
+├── evals/                   # eval set (evals.json: 4 evals)
+├── triggers/                # trigger queries (trigger-queries.json: 22 queries)
 └── tests/                   # pytest suite + bench/ known-vuln range (fixtures + manifest + README)
 ```
 

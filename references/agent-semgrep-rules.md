@@ -173,10 +173,10 @@ semgrep scan --config auto --config agent-antipatterns.yml --sarif --output <out
 或者与 `run_scan.py` 解耦，单独跑一次 agent 反模式扫描：
 
 ```bash
-semgrep scan --config agent-antipatterns.yml --sarif --output <out>/agent-antipatterns.sarif <target>
+semgrep scan --config agent-antipatterns.yml --sarif --output <out>/semgrep-agent.sarif <target>
 ```
 
-输出 SARIF 文件落入与其他工具相同的 `<out>/` 目录，`generate_report.py` 会自动解析并合并进统一报告。
+输出 SARIF 文件落入与其他工具相同的 `<out>/` 目录，文件名必须是 `semgrep-agent.sarif`（与 `run_scan.py --agent-rules` 的输出名一致）：`generate_report.py` 只按精确文件名收集该文件，其他文件名不会进统一报告。
 
 ## 完整规则文件
 

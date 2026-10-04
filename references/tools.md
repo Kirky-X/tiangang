@@ -123,7 +123,7 @@
 
 ## Ruby —— Brakeman
 
-- 检测:`Gemfile` + `app/` 或 `config/routes.rb`(Rails 特征),或 `.rb` 文件占多数
+- 检测:`Gemfile`,或 `.rb` 文件占多数
 - 检查:`command -v brakeman`
 - 安装:`gem install brakeman`
 - 扫描:`brakeman -f sarif -o <out>/brakeman.sarif <target>`
@@ -249,12 +249,13 @@ AI 驱动的代码审查工具，读取 Git diff 并生成结构化、行级精�
 | Python | `requirements.txt`、`pyproject.toml`、`setup.py`、`Pipfile` | `.py` |
 | Java | `pom.xml`、`build.gradle`、`build.gradle.kts` | `.java` |
 | Go | `go.mod` | `.go` |
-| C/C++ | `CMakeLists.txt`、`Makefile`、`configure.ac`、`meson.build` | `.c`、`.h`、`.cpp`、`.hpp`、`.cc` |
+| C/C++ | `CMakeLists.txt`、`configure.ac`、`meson.build` | `.c`、`.h`、`.cpp`、`.hpp`、`.cc`、`.cxx` |
 | Ruby | `Gemfile` | `.rb` |
 | PHP | `composer.json` | `.php` |
 | .NET | `.csproj`、`.sln` | `.cs` |
 | Rust | `Cargo.toml` | `.rs` |
-| IaC | `main.tf`、`terraform.tf`、`Chart.yaml`、`Dockerfile`、`docker-compose.yml`、`.github/workflows/*.yml`(路径级匹配,文件名匹配表达不了) | `.tf`、`.hcl` |
+| JavaScript/TypeScript | `package.json`、`package-lock.json`、`tsconfig.json` | `.js`、`.jsx`、`.mjs`、`.cjs`、`.ts`、`.tsx`、`.mts`、`.cts` |
+| IaC | `main.tf`、`terraform.tf`、`Chart.yaml`、`Dockerfile`、`docker-compose.yml`、`docker-compose.yaml`、`.github/workflows/*.yml`/`*.yaml`(路径级匹配,文件名匹配表达不了) | `.tf`、`.hcl` |
 | Kotlin | — | `.kt`、`.kts` |
 | Swift | — | `.swift` |
 | Scala | — | `.scala` |
