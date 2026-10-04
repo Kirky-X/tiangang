@@ -27,6 +27,7 @@ bash scripts/install-skill.sh install tiangang
 
 # Option 2: manual copy into an agent skills directory
 cp -r tiangang/ ~/.zcode/skills/tiangang/
+
 # Option 3: Remote install (GitHub repo)
 npx skills add Kirky-X/tiangang --agent claude-code -y
 ```

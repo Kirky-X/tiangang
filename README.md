@@ -26,7 +26,8 @@ bash scripts/install-skill.sh install tiangang
 
 # 方式 2：手动拷贝到 agent 技能目录
 cp -r tiangang/ ~/.zcode/skills/tiangang/
-# 方式三：远程安装（GitHub 仓库）
+
+# 方式 3：远程安装（GitHub 仓库）
 npx skills add Kirky-X/tiangang --agent claude-code -y
 ```
 
