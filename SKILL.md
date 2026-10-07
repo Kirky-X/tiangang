@@ -3,7 +3,7 @@ name: tiangang
 description: "专业 SAST 安全审查工具集，运行 Semgrep 与各语言专属扫描器产出统一报告（CodeQL 为可选 opt-in，不进默认流程），可选叠加 AI 代码审查（OCR）。触发词：安全审查/漏洞扫描/SAST/代码安全检查/hardcoded secrets/SQL injection/unsafe eval/buffer overflow/insecure deserialization/发布前安全检查/AI代码审查。边界：代码质量/风格/架构审查与 PR 审查编排（review pr）用 diting，本 skill 只做安全扫描。依赖树分析、豁免管理与升级模拟用 dayv，本 skill 的 Trivy SCA 只是整仓安全扫描的一条通道；agent 架构反模式审计用 diting（review agent），本 skill 只捕 agent 相关安全 taint 信号。"
 license: MIT
 metadata:
-  version: "0.2.4"
+  version: "0.2.5"
   author: "Kirky-X"
   repo: "https://github.com/Kirky-X/tiangang"
   tags: "sast, security-audit, vulnerability-scan, semgrep, codeql, bandit, gosec, static-analysis, security, sca, secret-scan, trivy, gitleaks, trufflehog, ci-cd, incremental-scan, trend-tracking, plugin-architecture, ai-code-review, open-code-review, ocr"
